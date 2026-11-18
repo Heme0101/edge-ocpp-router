@@ -8,3 +8,9 @@ def test_spare_power_smaller_than_reserve():
 
 def test_over_power_limit():
     assert available_ev_budget_kw(55.0) == 0
+
+def test_negative_building_load_gives_zero_budget():
+    assert available_ev_budget_kw(-35.0) == 0
+
+def test_zero_building_load_gives_full_budget():
+    assert available_ev_budget_kw(0.0) == 48.0

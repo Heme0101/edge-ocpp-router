@@ -2,6 +2,8 @@ TRANSFORMER_LIMIT_KW = 50.0
 ENERGY_RESERVE = 2.0
 
 def available_ev_budget_kw(building_load_kw):
+    if building_load_kw < 0:
+        return 0
     if TRANSFORMER_LIMIT_KW - building_load_kw >= ENERGY_RESERVE:
         non_idle_energy = building_load_kw + ENERGY_RESERVE
         return TRANSFORMER_LIMIT_KW  - non_idle_energy
