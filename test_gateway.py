@@ -26,6 +26,5 @@ def test_soc_weights_out_of_boundary():
     assert gateway.soc_weights(297.0) == 0.0
 
 def test_allocate_power_shares_add_up_to_budget():
-    ev_budget = gateway.available_ev_budget_kw(200.0)
-    shares = gateway.allocate_power({'CP_1': 22.0, 'CP_2': 3.0, 'CP_3' : 67.0, 'CP_4' : 91.0}, 200.0)
-    assert sum(shares.values()) == pytest.approx(ev_budget)
+    shares = gateway.allocate_power({'CP_1': 22.0, 'CP_2': 3.0, 'CP_3' : 67.0, 'CP_4' : 91.0}, 280.0)
+    assert sum(shares.values()) == 280.0
