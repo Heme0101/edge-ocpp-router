@@ -1,5 +1,4 @@
 import gateway
-import pytest
 
 def test_quiet_building_leaves_budget():
     assert gateway.available_ev_budget_kw(35.0) == 445.0
@@ -28,3 +27,16 @@ def test_soc_weights_out_of_boundary():
 def test_allocate_power_shares_add_up_to_budget():
     shares = gateway.allocate_power({'CP_1': 22.0, 'CP_2': 3.0, 'CP_3' : 67.0, 'CP_4' : 91.0}, 280.0)
     assert sum(shares.values()) == 280.0
+
+def limit_of(message):
+    schedule = message[3]["csChargingProfiles"]["chargingSchedule"]
+    return schedule["chargingSchedulePeriod"][0]["limit"]
+
+def test_negative_allocation_converts_kw_to_watts():
+    assert limit_of(gateway.build_charging_profile(1, -70.0)) == 0.0
+
+def test_below_min_charge_snaps_to_zero():
+    assert limit_of(gateway.build_charging_profile(1, 0.0)) == 0.0
+
+def test_normal_allocation_converts_kw_to_watts():
+    assert limit_of(gateway.build_charging_profile(1, 11.2)) == 11200.0

@@ -1,6 +1,10 @@
+import uuid
+
+MIN_CHARGE_W = 1400.0
+CHARGING_PROFILE_ID = 1
+
 TRANSFORMER_LIMIT_KW = 600.0
 ENERGY_RESERVE = 120.0
-ev_share = 0
 
 def available_ev_budget_kw(building_load_kw):
     if building_load_kw < 0.0:
@@ -35,6 +39,31 @@ def allocate_power(socs, ev_share):
         power_reserved_kw[charger_id] = ev_share * weight / total_weight
 
     return power_reserved_kw
+
+
+def build_charging_profile(connector_id: int, allocated_kw: float) -> list:
+    watts = round(max(0.0, allocated_kw) * 1000, 1)
+
+    # 2. Below the minimum a charger can't regulate --> snaps cleanly to 0 W
+    if watts < MIN_CHARGE_W:
+        watts = 0.0
+
+    payload = {
+        "connectorId": connector_id,
+        "csChargingProfiles": {
+            "chargingProfileId": CHARGING_PROFILE_ID,
+            "stackLevel": 0,
+            "chargingProfilePurpose": "TxDefaultProfile",
+            "chargingProfileKind": "Relative",
+            "chargingSchedule": {
+                "chargingRateUnit": "W",
+                "chargingSchedulePeriod": [{"startPeriod": 0, "limit": watts}],
+            },
+        },
+    }
+
+    return [2, str(uuid.uuid4()), "SetChargingProfile", payload]
+
 
 if __name__ == "__main__":
     building_load_kw = 200.0
