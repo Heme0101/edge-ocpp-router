@@ -25,7 +25,6 @@ def test_soc_weights_middle():
 def test_soc_weights_out_of_boundary():
     assert gateway.soc_weights(297.0) == 0.0
 
-# soc 10 -> weight 3.0, soc 50 -> weight 1.5 (same ratio as 3:1:1 after the cap)
 def test_allocate_power_all_capped():
     shares = gateway.allocate_power({'CP_1': 10.0, 'CP_2': 50.0, 'CP_3': 50.0}, 30.0)
     assert shares == {'CP_1': 10.0, 'CP_2': 10.0, 'CP_3': 10.0}
@@ -60,8 +59,14 @@ def limit_of(message):
 def test_negative_allocation_converts_kw_to_watts():
     assert limit_of(gateway.build_charging_profile(1, -70.0)) == 0.0
 
-def test_below_min_charge_snaps_to_zero():
+def test_zero_kw_conversion_to_watt():
     assert limit_of(gateway.build_charging_profile(1, 0.0)) == 0.0
 
 def test_normal_allocation_converts_kw_to_watts():
     assert limit_of(gateway.build_charging_profile(1, 11.2)) == 11200.0
+
+def test_appropriate_split_cap_allocations():
+    active = {"CP_1":3.0, "CP_2":1.5, "CP_3":0.5}
+    results = gateway.split_with_cap(active, 150.0)
+    assert results == {"CP_1":10.0, "CP_2":10.0, "CP_3":10.0}
+    assert 150.0 - sum(results.values()) == 120
