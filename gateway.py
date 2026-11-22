@@ -5,6 +5,7 @@ CHARGING_PROFILE_ID = 1
 
 TRANSFORMER_LIMIT_KW = 600.0
 ENERGY_RESERVE = 120.0
+MAX_CHARGER_KW = 10.0
 
 def available_ev_budget_kw(building_load_kw):
     if building_load_kw < 0.0:
@@ -28,18 +29,30 @@ def soc_weights(soc):
         return 0.0
 
 def allocate_power(socs, ev_share):
+    """Split ev_share among chargers by SoC weight, capping each at MAX_CHARGER_KW.
+
+    Cars whose weighted share exceeds the cap are fixed at the cap and removed;
+    the budget they could not take is redistributed among the rest, repeating
+    until nobody exceeds the cap. Weight-0 cars get 0.0. Leftover power goes unused.
+    """
     weights = {charger_id: soc_weights(soc) for charger_id, soc in socs.items()}
-    total_weight = sum(weights.values())
+    power_reserved_kw = {charger_id: 0.0 for charger_id in weights}
+    active = {charger_id: w for charger_id, w in weights.items() if w > 0}
+    remaining_kw = max(ev_share, 0.0)
 
-    if total_weight == 0:
-        return {charger_id: 0.0 for charger_id in weights}
-
-    power_reserved_kw = {}
-    for charger_id, weight in weights.items():
-        power_reserved_kw[charger_id] = ev_share * weight / total_weight
+    while active:
+        total_weight = sum(active.values())
+        shares = {cid: remaining_kw * w / total_weight for cid, w in active.items()}
+        capped = [cid for cid, share in shares.items() if share > MAX_CHARGER_KW]
+        if not capped:
+            power_reserved_kw.update(shares)
+            break
+        for cid in capped:
+            power_reserved_kw[cid] = MAX_CHARGER_KW
+            remaining_kw -= MAX_CHARGER_KW
+            del active[cid]
 
     return power_reserved_kw
-
 
 def build_charging_profile(connector_id: int, allocated_kw: float) -> list:
     watts = round(max(0.0, allocated_kw) * 1000, 1)
