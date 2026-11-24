@@ -78,6 +78,7 @@ class SimCharger:
         self.received = []                  # (purpose, W) of every profile, for tests
         self.remote_stopped = False
         self.client = None
+        self.configuration = {}             # keys set by ChangeConfiguration
         self._followups = set()
 
     @property
@@ -122,6 +123,11 @@ class SimCharger:
             self.received.append((purpose, limit))
             suffix = "" if purpose == TX_PROFILE else f" ({purpose})"
             self.say(f"Received limit: {limit:.1f} W{suffix}")
+            return {"status": "Accepted"}
+        if action == "ChangeConfiguration":
+            if payload.get("key") == "MeterValueSampleInterval":
+                self.meter_interval_s = float(payload["value"])
+            self.configuration[payload.get("key")] = payload.get("value")
             return {"status": "Accepted"}
         if action == "RemoteStopTransaction":
             if payload.get("transactionId") != self.transaction_id or not self.charging:
@@ -205,13 +211,18 @@ class SimCharger:
 
 
 class SimSiteMeter:
-    """The building's CT meter: reports the non-EV building load as Power.Active.Import on
-    connector 0 (OCPP's main-meter connector). Stops reporting after dropout_after_s, if
-    set, to demonstrate the stale-telemetry floor."""
+    """The CT clamp on the building's main feeder. Like the real one it measures the WHOLE
+    site: the other loads (load_kw) plus whatever the simulated chargers draw right now.
+    Reports Power.Active.Import on connector 0 (OCPP's main-meter connector). Stops
+    reporting after dropout_after_s, if set, to demonstrate the stale-telemetry floor."""
 
-    def __init__(self, meter_id, load_kw, *, interval_s=5.0, dropout_after_s=None, quiet=False):
-        self.meter_id, self.load_kw = meter_id, load_kw
+    def __init__(self, meter_id, load_kw, *, chargers=(), interval_s=5.0, dropout_after_s=None,
+                 quiet=False):
+        self.meter_id, self.load_kw, self.chargers = meter_id, load_kw, list(chargers)
         self.interval_s, self.dropout_after_s, self.quiet = interval_s, dropout_after_s, quiet
+
+    def total_kw(self):
+        return self.load_kw + sum(charger.power_w() for charger in self.chargers) / 1000.0
 
     async def run(self, url):
         async with connect(f"{url}/{self.meter_id}", subprotocols=["ocpp1.6"]) as ws:
@@ -230,7 +241,7 @@ class SimSiteMeter:
                         return
                     await client.call("MeterValues", {"connectorId": 0, "meterValue": [{
                         "timestamp": now_iso(),
-                        "sampledValue": [{"value": f"{self.load_kw:.1f}",
+                        "sampledValue": [{"value": f"{self.total_kw():.3f}",
                                           "measurand": "Power.Active.Import", "unit": "kW"}]}]})
                     await asyncio.sleep(self.interval_s)
             finally:
@@ -257,8 +268,7 @@ def parse_cars(text):
 
 async def main(args):
     url = args.url.rstrip("/")
-    tasks = [SimSiteMeter(args.site_meter_id, args.building_load_kw, interval_s=args.meter_interval,
-                          dropout_after_s=args.ct_dropout_after).run(url)]
+    chargers = []
     for charger_id, soc in args.cars:
         reject = set()
         if charger_id in args.reject_tx or charger_id in args.reject_all:
@@ -269,8 +279,10 @@ async def main(args):
                              reports_soc=soc is not None, battery_kwh=args.battery_kwh,
                              car_max_kw=args.car_max_kw, time_scale=args.time_scale,
                              meter_interval_s=args.meter_interval, reject=reject)
-        tasks.append(charger.run(url))
-    await asyncio.gather(*tasks)
+        chargers.append(charger)
+    meter = SimSiteMeter(args.site_meter_id, args.building_load_kw, chargers=chargers,
+                         interval_s=args.ct_interval, dropout_after_s=args.ct_dropout_after)
+    await asyncio.gather(meter.run(url), *(charger.run(url) for charger in chargers))
 
 
 if __name__ == "__main__":
@@ -279,7 +291,9 @@ if __name__ == "__main__":
     parser.add_argument("--url", default=f"ws://{cfg.host}:{cfg.port}")
     parser.add_argument("--cars", type=parse_cars, default=parse_cars("CP_1:22,CP_2:67"),
                         help="ID:SOC pairs; SOC 'none' = a car that reports no SoC (J1772)")
-    parser.add_argument("--building-load-kw", type=float, default=470.0)
+    parser.add_argument("--building-load-kw", type=float, default=470.0,
+                        help="the site's other (non-EV) loads; the CT reports these plus the EVs")
+    parser.add_argument("--ct-interval", type=float, default=1.0, help="seconds between CT readings")
     parser.add_argument("--site-meter-id", default=cfg.site_meter_id)
     parser.add_argument("--battery-kwh", type=float, default=60.0)
     parser.add_argument("--car-max-kw", type=float, default=11.5, help="the car's own onboard limit")

@@ -8,8 +8,17 @@ from conftest import OFF_PEAK
 from sim_chargers import SimCharger, SimSiteMeter
 
 
+CT_RESOLUTION_KW = 0.001                    # the simulated CT reports whole watts (3 decimals of kW)
+
+
 def fast(cfg, **changes):
     return dataclasses.replace(cfg, allocation_interval_s=0.1, call_timeout_s=2.0, **changes)
+
+
+def quick_cars(*cars):
+    for car in cars:
+        car.meter_interval_s = 0.1          # fresh EV power readings for the CT subtraction
+    return cars
 
 
 async def run_site(cfg, chargers, meter, seconds):
@@ -30,10 +39,9 @@ async def run_site(cfg, chargers, meter, seconds):
 
 
 def test_demo_split_end_to_end(cfg):
-    cp1 = SimCharger("CP_1", 22.0, quiet=True)
-    cp2 = SimCharger("CP_2", 67.0, quiet=True)
-    meter = SimSiteMeter("SITE_METER", 470.0, interval_s=0.2, quiet=True)
-    cs = asyncio.run(run_site(fast(cfg), [cp1, cp2], meter, 1.5))
+    cp1, cp2 = quick_cars(SimCharger("CP_1", 22.0, quiet=True), SimCharger("CP_2", 67.0, quiet=True))
+    meter = SimSiteMeter("SITE_METER", 470.0, chargers=[cp1, cp2], interval_s=0.2, quiet=True)
+    cs = asyncio.run(run_site(fast(cfg), [cp1, cp2], meter, 2.0))
     assert ("TxProfile", 6666.0) in cp1.received
     assert ("TxProfile", 3333.0) in cp2.received
     assert cp1.received[-1] == ("TxProfile", 6666.0)
@@ -45,8 +53,8 @@ def test_charger_rejecting_everything_is_remote_stopped(cfg):
     good = SimCharger("CP_1", 22.0, quiet=True)
     bad = SimCharger("CP_2", 67.0, quiet=True,
                      reject={"TxProfile", "TxDefaultProfile", "ChargePointMaxProfile"})
-    meter = SimSiteMeter("SITE_METER", 470.0, interval_s=0.2, quiet=True)
-    cs = asyncio.run(run_site(fast(cfg), [good, bad], meter, 1.5))
+    meter = SimSiteMeter("SITE_METER", 470.0, chargers=[good, bad], interval_s=0.2, quiet=True)
+    cs = asyncio.run(run_site(fast(cfg), [good, bad], meter, 2.0))
     assert bad.remote_stopped and not bad.charging
     stopped = cs.chargers["CP_2"].connectors[1].session
     assert stopped.charging_stopped and stopped.stop_reason == "Remote"
@@ -55,16 +63,16 @@ def test_charger_rejecting_everything_is_remote_stopped(cfg):
 
 def test_charger_rejecting_tx_profile_uses_charge_point_max(cfg):
     picky = SimCharger("CP_1", 22.0, quiet=True, reject={"TxProfile", "TxDefaultProfile"})
-    meter = SimSiteMeter("SITE_METER", 470.0, interval_s=0.2, quiet=True)
-    cs = asyncio.run(run_site(fast(cfg), [picky], meter, 1.0))
+    meter = SimSiteMeter("SITE_METER", 470.0, chargers=[picky], interval_s=0.2, quiet=True)
+    cs = asyncio.run(run_site(fast(cfg), [picky], meter, 1.5))
     assert ("ChargePointMaxProfile", 10000.0) in picky.received
     assert picky.charging and cs.chargers["CP_1"].use_max_profile
 
 
 def test_ct_dropout_throttles_to_floor(cfg):
     cp1 = SimCharger("CP_1", 22.0, quiet=True)
-    meter = SimSiteMeter("SITE_METER", 470.0, interval_s=0.1, dropout_after_s=0.3, quiet=True)
-    asyncio.run(run_site(fast(cfg, telemetry_stale_after_s=0.4), [cp1], meter, 1.6))
+    meter = SimSiteMeter("SITE_METER", 470.0, chargers=[cp1], interval_s=0.1, dropout_after_s=0.3, quiet=True)
+    asyncio.run(run_site(fast(cfg, telemetry_stale_after_s=1.5, meter_sample_interval_s=1), [cp1], meter, 3.0))
     assert ("TxProfile", 10000.0) in cp1.received
     assert cp1.received[-1] == ("TxProfile", 2000.0)
 
@@ -82,3 +90,74 @@ def test_battery_rises_with_power_received_and_not_without():
     car.soc = 99.99
     car.step(3600)
     assert car.soc == 100.0 and car.power_w() == 0.0
+
+
+def test_building_spike_throttles_sharply_end_to_end(cfg):
+    cp1, cp2 = quick_cars(SimCharger("CP_1", 22.0, quiet=True), SimCharger("CP_2", 67.0, quiet=True))
+    meter = SimSiteMeter("SITE_METER", 470.0, chargers=[cp1, cp2], interval_s=0.1, quiet=True)
+
+    async def scenario():
+        cs = server.CentralSystem(fast(cfg), clock=lambda: OFF_PEAK)
+        ws_server = await server.start_server(cs, "127.0.0.1", 0)
+        url = f"ws://127.0.0.1:{ws_server.sockets[0].getsockname()[1]}"
+        tasks = [asyncio.create_task(server.allocation_loop(cs)), asyncio.create_task(meter.run(url)),
+                 asyncio.create_task(cp1.run(url)), asyncio.create_task(cp2.run(url))]
+        try:
+            await asyncio.sleep(1.5)
+            assert (cp1.power_w(), cp2.power_w()) == (6666.0, 3333.0)
+            meter.load_kw = 476.0                          # other loads jump by 6 kW
+            await asyncio.sleep(1.0)
+            # New 4 kW budget: 3:1.5 would give CP_2 1333 W, under the 1440 W minimum,
+            # so the higher-priority CP_1 gets all of it.
+            assert (cp1.power_w(), cp2.power_w()) == (4000.0, 0.0)
+            meter.load_kw = 470.0                          # load drops again
+            await asyncio.sleep(1.5)
+            assert (cp1.power_w(), cp2.power_w()) == (6666.0, 3333.0)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            ws_server.close()
+            await ws_server.wait_closed()
+    asyncio.run(scenario())
+
+
+def test_ct_never_exceeds_usable_capacity_under_random_load(cfg):
+    """Other loads wander randomly near the limit; the CT total (EVs included) is sampled
+    the whole time and must stay within panel - margin, apart from the instant of a jump."""
+    import random
+    rng = random.Random(3)
+    cars = quick_cars(*(SimCharger(f"CP_{i}", rng.choice([10.0, 50.0, 90.0]), quiet=True) for i in range(4)))
+    meter = SimSiteMeter("SITE_METER", 470.0, chargers=cars, interval_s=0.05, quiet=True)
+    usable = cfg.panel_limit_kw - cfg.safety_margin_kw
+
+    async def scenario():
+        cs = server.CentralSystem(fast(cfg), clock=lambda: OFF_PEAK)
+        ws_server = await server.start_server(cs, "127.0.0.1", 0)
+        url = f"ws://127.0.0.1:{ws_server.sockets[0].getsockname()[1]}"
+        tasks = [asyncio.create_task(server.allocation_loop(cs)), asyncio.create_task(meter.run(url))]
+        tasks += [asyncio.create_task(c.run(url)) for c in cars]
+        longest, streak, sampled = 0.0, 0.0, 0
+        try:
+            await asyncio.sleep(1.5)
+            loop = asyncio.get_running_loop()
+            for _ in range(40):
+                meter.load_kw = rng.uniform(455.0, 479.0)  # always leaves some EV budget
+                end = loop.time() + 0.4
+                while loop.time() < end:
+                    await asyncio.sleep(0.01)
+                    sampled += 1
+                    streak = streak + 0.01 if meter.total_kw() > usable + CT_RESOLUTION_KW else 0.0
+                    longest = max(longest, streak)
+            # A jump in other loads overshoots until the next CT reading (50 ms) plus one
+            # immediate cycle and a profile round trip; it must never persist.
+            assert sampled > 1000
+            assert longest <= 0.25, longest
+            assert meter.total_kw() <= usable + CT_RESOLUTION_KW
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            ws_server.close()
+            await ws_server.wait_closed()
+    asyncio.run(scenario())

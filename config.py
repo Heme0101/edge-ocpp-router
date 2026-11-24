@@ -17,13 +17,13 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("site_config.json")
 
 _SCHEMA = {
     "site": {"panel_limit_kw", "safety_margin_kw", "site_meter_id", "timezone"},
-    "chargers": {"max_charger_kw", "min_charger_kw", "taper_threshold_w", "taper_grace_s",
-                 "offline_session_timeout_s"},
+    "chargers": {"max_charger_kw", "min_charger_kw", "min_increase_w", "taper_threshold_w",
+                 "taper_grace_s", "offline_session_timeout_s"},
     "telemetry": {"stale_after_s", "stale_floor_kw"},
     "tariff": {"peak_windows", "peak_budget_cap_kw"},
     "grid_signal": {"enabled", "poll_interval_s", "max_age_s"},
     "server": {"host", "port", "allocation_interval_s", "profile_refresh_s", "call_timeout_s",
-               "session_log_path"},
+               "meter_sample_interval_s", "session_log_path"},
 }
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
@@ -55,6 +55,7 @@ class SiteConfig:
     timezone: str
     max_charger_kw: float
     min_charger_kw: float
+    min_increase_w: float
     taper_threshold_w: float
     taper_grace_s: float
     offline_session_timeout_s: float
@@ -70,6 +71,7 @@ class SiteConfig:
     allocation_interval_s: float
     profile_refresh_s: float
     call_timeout_s: float
+    meter_sample_interval_s: int
     session_log_path: str | None
 
     def __post_init__(self):
@@ -90,6 +92,10 @@ class SiteConfig:
         _check("chargers.max_charger_kw", self.max_charger_kw, low=0.0, low_inclusive=False)
         _check("chargers.min_charger_kw", self.min_charger_kw, low=0.0, low_inclusive=False,
                high=self.max_charger_kw)
+        # Increases smaller than this are not sent (decreases always are). It must stay
+        # below the minimum, or a stopped car could never be started.
+        _check("chargers.min_increase_w", self.min_increase_w, low=0.0,
+               high=self.min_charger_kw * 1000.0, high_inclusive=False)
         # A threshold at or above the minimum would make every car at the minimum look idle.
         _check("chargers.taper_threshold_w", self.taper_threshold_w, low=0.0,
                high=self.min_charger_kw * 1000.0, high_inclusive=False)
@@ -116,6 +122,12 @@ class SiteConfig:
         _check("server.allocation_interval_s", self.allocation_interval_s, low=0.0, low_inclusive=False)
         _check("server.profile_refresh_s", self.profile_refresh_s, low=0.0, low_inclusive=False)
         _check("server.call_timeout_s", self.call_timeout_s, low=0.0, low_inclusive=False)
+        if isinstance(self.meter_sample_interval_s, bool) or not isinstance(self.meter_sample_interval_s, int) \
+                or not 1 <= self.meter_sample_interval_s < self.telemetry_stale_after_s:
+            # OCPP's MeterValueSampleInterval is whole seconds; readings must arrive well
+            # before they would count as stale.
+            raise ConfigError("server.meter_sample_interval_s must be a whole number of seconds, "
+                              "at least 1 and below telemetry.stale_after_s")
         if self.session_log_path is not None:
             _check_text("server.session_log_path", self.session_log_path)
 
@@ -157,6 +169,7 @@ def load_site_config(path: str | Path = DEFAULT_CONFIG_PATH) -> SiteConfig:
         timezone=site["timezone"],
         max_charger_kw=_num("chargers.max_charger_kw", chargers["max_charger_kw"]),
         min_charger_kw=_num("chargers.min_charger_kw", chargers["min_charger_kw"]),
+        min_increase_w=_num("chargers.min_increase_w", chargers["min_increase_w"]),
         taper_threshold_w=_num("chargers.taper_threshold_w", chargers["taper_threshold_w"]),
         taper_grace_s=_num("chargers.taper_grace_s", chargers["taper_grace_s"]),
         offline_session_timeout_s=_num("chargers.offline_session_timeout_s",
@@ -173,6 +186,7 @@ def load_site_config(path: str | Path = DEFAULT_CONFIG_PATH) -> SiteConfig:
         allocation_interval_s=_num("server.allocation_interval_s", server["allocation_interval_s"]),
         profile_refresh_s=_num("server.profile_refresh_s", server["profile_refresh_s"]),
         call_timeout_s=_num("server.call_timeout_s", server["call_timeout_s"]),
+        meter_sample_interval_s=server["meter_sample_interval_s"],
         session_log_path=log_path,
     )
 

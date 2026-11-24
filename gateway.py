@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass
+from fractions import Fraction
 from datetime import datetime, timezone
 
 from config import SiteConfig
@@ -63,14 +64,19 @@ def session_weight(soc, kwh_delivered):
     return soc_weights(soc) if soc is not None else energy_weights(kwh_delivered)
 
 
-def floor_to_watt(kw):
-    """Round DOWN to a whole watt so rounding can never push the total over the budget.
+def watts_floor(kw) -> int:
+    """kW -> whole watts, rounded DOWN, so rounding can never push a total over a budget.
 
-    round(..., 6) first removes binary floating-point noise. The split computes
-    1.4 * 3.0 / 3.0, which comes out as 1.3999999999999997, not exactly 1.4. That would
-    floor to 1399 W and wrongly fall under the 1400 W minimum.
+    Floats are binary: 1.4 is stored as 1.39999999999999991, and 600 - (470.1 + 120) comes
+    out as 9.899999999999977. round(..., 6) first strips that representation noise
+    (it moves a value by at most half a microwatt), then floor() rounds down.
     """
-    return math.floor(round(kw * 1000, 6)) / 1000
+    return math.floor(round(kw * 1000, 6))
+
+
+def watts_ceil(kw) -> int:
+    """kW -> whole watts, rounded UP: for minimums, so 'at least the minimum' stays true."""
+    return math.ceil(round(kw * 1000, 6))
 
 
 def split_with_cap(active, pool_kw, caps):
@@ -80,6 +86,7 @@ def split_with_cap(active, pool_kw, caps):
     A car whose share is over its cap gets exactly the cap and leaves the game; the
     power it couldn't take is shared among the cars still in play. Repeat until
     nobody is over the cap. Power left over when every car is capped goes unused.
+    Works on any number type; allocate_power passes exact integers and fractions.
     """
     active = dict(active)           # work on a copy, so the caller's dict isn't changed
     result = {}
@@ -98,35 +105,107 @@ def split_with_cap(active, pool_kw, caps):
     return result
 
 
-def allocate_power(weights, budget_kw, cfg: SiteConfig, caps=None):
+def allocate_power(weights, budget_kw, cfg: SiteConfig, caps=None, arrival=None):
     """Decide each charger's power in kW.
 
     weights: {charger_id: priority weight} (see session_weight).
     budget_kw: total kW available to all EVs.
     caps: optional {charger_id: kW} per-car ceiling, e.g. min_charger_kw for a car that
           has tapered off; anything missing or higher is held to max_charger_kw.
-    Returns {charger_id: kW}, every car included. Each value is at most its cap, the
-    total never exceeds the budget, and a car never gets a share too small to charge
-    with (under min_charger_kw): it gets 0.0 and its power goes to the others.
+    arrival: optional {charger_id: number}, e.g. plug-in time. When two cars have the
+          same weight and only one can charge, the one that arrived FIRST keeps charging
+          (first come, first served), so no car is starved by dictionary order and the
+          choice does not flip back and forth between cycles. Without it: listing order.
+    Returns {charger_id: kW}, every car included. Each value is a whole number of watts,
+    at most its cap; the total never exceeds the budget; and a car never gets a share too
+    small to charge with (under min_charger_kw): it gets 0.0 and its power goes to the others.
+
+    The arithmetic is exact: watts are integers and weights are Fractions, so no binary
+    rounding error can creep into a share. Each share is rounded down to a whole watt.
     """
     caps = caps or {}
-    car_caps = {cid: min(caps.get(cid, cfg.max_charger_kw), cfg.max_charger_kw) for cid in weights}
-    active = {cid: w for cid, w in weights.items() if w > 0.0}     # NaN and <= 0 sit out
-    budget_kw = budget_kw if math.isfinite(budget_kw) and budget_kw > 0.0 else 0.0
+    max_w = watts_floor(cfg.max_charger_kw)
+    min_w = watts_ceil(cfg.min_charger_kw)
+    car_caps = {cid: min(watts_floor(caps.get(cid, cfg.max_charger_kw)), max_w) for cid in weights}
+    budget_w = watts_floor(budget_kw) if math.isfinite(budget_kw) and budget_kw > 0.0 else 0
+    listed = {cid: i for i, cid in enumerate(weights)}
+    # NaN, inf and <= 0 weights sit out, and so does a car whose cap is below the minimum.
+    candidates = [cid for cid, w in weights.items()
+                  if math.isfinite(w) and w > 0.0 and car_caps[cid] >= min_w]
+    # Priority order: highest weight first; equal weights, first come first served.
+    candidates.sort(key=lambda cid: (-weights[cid],
+                                     arrival[cid] if arrival is not None else listed[cid]))
 
-    while True:
-        shares = split_with_cap(active, budget_kw, car_caps)
-        shares = {cid: floor_to_watt(kw) for cid, kw in shares.items()}
-        too_small = {cid: kw for cid, kw in shares.items() if kw < cfg.min_charger_kw}
-        if not too_small:
-            break
-        # Drop only the car with the smallest share, then redo the split: its power
-        # may lift the others above the minimum, so don't drop them all at once.
-        del active[min(too_small, key=too_small.get)]
+    def split(count):
+        active = {cid: Fraction(weights[cid]) for cid in candidates[:count]}
+        return {cid: math.floor(w) for cid, w in split_with_cap(active, budget_w, car_caps).items()}
+
+    # A car whose share is too small to charge on (under min_charger_kw) sits out and its
+    # power goes to the others. Shares are proportional to weight (or held at a cap that
+    # is >= the minimum), so the cars that sit out are always the LAST ones in priority
+    # order, and if the first k cars all get enough, so do the first k-1. So the cars that
+    # charge are the longest prefix that works, found by binary search: the same answer
+    # as dropping the smallest share one at a time, in O(log n) splits instead of O(n).
+    low, high = 0, len(candidates)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if all(w >= min_w for w in split(middle).values()):
+            low = middle
+        else:
+            high = middle - 1
+    shares = split(low)
 
     power_reserved_kw = {cid: 0.0 for cid in weights}   # everyone appears, default 0.0
-    power_reserved_kw.update(shares)
+    power_reserved_kw.update({cid: w / 1000 for cid, w in shares.items()})
     return power_reserved_kw
+
+
+def estimate_other_load_kw(site_total_kw, ev_draws_kw):
+    """Everything on the site that is not an EV, from the main-feeder CT reading.
+
+    The CT measures the whole building INCLUDING the chargers, so the chargers' own
+    metered draw is subtracted. The caller passes, per car, the smaller of its fresh
+    metered power and the limit it accepted: that can only under-count EV power, which
+    over-counts the other loads and so errs toward a smaller EV budget, never a larger one.
+    A negative result (meters briefly disagreeing) is treated as 0. The result is rounded
+    UP to a whole watt: a bigger other load means a smaller EV budget, the safe direction.
+    """
+    return max(0, watts_ceil(site_total_kw - sum(ev_draws_kw))) / 1000
+
+
+def transition_safe_limits(targets_w, committed_w, budget_w, reserved_w, priority, min_w):
+    """The limits that are safe to send RIGHT NOW on the way to `targets_w`.
+
+    A charger only lowers its draw once it has accepted a new limit, so until then every
+    car may still draw what it is committed to (its accepted limit, or a pending higher
+    one). Decreases are therefore sent at once and in full; increases are granted only
+    from headroom that exists while every other car still draws its committed amount
+    (pending decreases are NOT counted as freed). Power freed by a decrease is handed out
+    on the next cycle, once the decrease is confirmed. Highest priority is served first;
+    a partial increase is allowed, except one that would leave a car below min_w (it
+    could not charge on it, so that headroom is left for the next car).
+
+    All values are integer watts. Guarantees: sum(result) + reserved_w <= budget_w
+    whenever sum(committed) + reserved_w <= budget_w, and no car's limit ever rises
+    while that would not hold.
+    """
+    result, increases = {}, []
+    for key, target in targets_w.items():
+        if target <= committed_w[key]:
+            result[key] = target                    # decrease (or no change): always safe
+        else:
+            increases.append(key)
+            result[key] = committed_w[key]          # stays put unless headroom allows more
+    headroom = budget_w - reserved_w - sum(committed_w.values())
+    for key in sorted(increases, key=lambda k: (-priority[k], str(k))):
+        if headroom <= 0:
+            break
+        grant = min(targets_w[key] - committed_w[key], headroom)
+        if result[key] + grant < min_w:
+            continue
+        result[key] += grant
+        headroom -= grant
+    return result
 
 
 @dataclass(frozen=True)
@@ -197,10 +276,10 @@ def build_charging_profile(connector_id: int, allocated_kw: float, cfg: SiteConf
 
     if not math.isfinite(allocated_kw):
         allocated_kw = 0.0              # never put Infinity/NaN on the wire
-    watts = round(max(0.0, allocated_kw) * 1000, 1)
+    watts = float(watts_floor(max(0.0, allocated_kw)))     # whole watts, rounded down
 
     # Below the minimum a charger can't regulate --> snaps cleanly to 0 W
-    if watts < round(cfg.min_charger_kw * 1000, 6):
+    if watts < watts_ceil(cfg.min_charger_kw):
         watts = 0.0
 
     schedule = {

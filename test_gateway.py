@@ -101,13 +101,14 @@ def test_allocate_power_all_zero_weight(cfg):
     assert gateway.allocate_power(by_soc({'CP_1': 100.0, 'CP_2': -1.0}), 30.0, cfg) == {'CP_1': 0.0, 'CP_2': 0.0}
 
 def test_allocate_power_drops_share_below_minimum(cfg):
-    # 2.0 kW floor split 3:1.5 would be 1.333 / 0.666: both too small, so the smaller one
+    # 2.0 kW floor split 3:1.5 would be 1.333 / 0.666: both under 1.44, so the smaller one
     # drops out and the other gets all of it.
     shares = gateway.allocate_power(by_soc({'CP_1': 22.0, 'CP_2': 67.0}), 2.0, cfg)
     assert shares == {'CP_1': 2.0, 'CP_2': 0.0}
 
 def test_allocate_power_budget_below_minimum_gives_nothing(cfg):
-    assert gateway.allocate_power(by_soc({'CP_1': 22.0}), 1.399, cfg) == {'CP_1': 0.0}
+    assert gateway.allocate_power(by_soc({'CP_1': 22.0}), 1.439, cfg) == {'CP_1': 0.0}
+    assert gateway.allocate_power(by_soc({'CP_1': 22.0}), 1.44, cfg) == {'CP_1': 1.44}
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -5.0])
 def test_allocate_power_bad_budget_gives_nothing(cfg, bad):
@@ -116,7 +117,7 @@ def test_allocate_power_bad_budget_gives_nothing(cfg, bad):
 def test_allocate_power_tapered_car_capped_and_headroom_redistributed(cfg):
     weights = by_soc({'CP_1': 22.0, 'CP_2': 67.0})
     shares = gateway.allocate_power(weights, 10.0, cfg, caps={'CP_1': cfg.min_charger_kw})
-    assert shares == {'CP_1': 1.4, 'CP_2': 8.6}
+    assert shares == {'CP_1': 1.44, 'CP_2': 8.56}
 
 def test_allocate_power_caps_never_exceed_max(cfg):
     shares = gateway.allocate_power({'CP_1': 3.0}, 50.0, cfg, caps={'CP_1': 99.0})
@@ -136,7 +137,7 @@ def test_allocate_power_randomised_invariants(cfg):
     for _ in range(5000):
         n = rng.randint(1, 12)
         weights = {f"CP_{i}": rng.choice([0.0, 0.5, 1.5, 3.0]) for i in range(n)}
-        caps = {cid: rng.choice([cfg.min_charger_kw, cfg.max_charger_kw, rng.uniform(1.4, 10.0)])
+        caps = {cid: rng.choice([cfg.min_charger_kw, cfg.max_charger_kw, rng.uniform(1.44, 10.0)])
                 for cid in weights if rng.random() < 0.3}
         budget = rng.choice([0.0, rng.uniform(0.0, 3.0), rng.uniform(0.0, 150.0)])
         shares = gateway.allocate_power(weights, budget, cfg, caps)
@@ -166,9 +167,27 @@ def test_split_with_cap_does_not_change_input():
     gateway.split_with_cap(active, 50.0, {"CP_1": 10.0})
     assert active == {"CP_1": 3.0}
 
-def test_floor_to_watt_removes_float_noise():
-    assert gateway.floor_to_watt(1.4 * 3.0 / 3.0) == 1.4
-    assert gateway.floor_to_watt(6.6666666) == 6.666
+def test_watts_round_down_without_float_noise():
+    assert gateway.watts_floor(1.4 * 3.0 / 3.0) == 1400          # 1.3999999999999997 kW
+    assert gateway.watts_floor(600 - (470.1 + 120)) == 9900      # 9.899999999999977 kW
+    assert gateway.watts_floor(6.6666666) == 6666
+    assert gateway.watts_floor(6.6669999) == 6666                 # always down, never up
+    assert gateway.watts_ceil(1.44) == 1440 and gateway.watts_ceil(1.4401) == 1441
+
+
+def test_allocation_is_exact_integer_watts(cfg):
+    # 10 kW three ways: 3333 W each, 1 W left over, never 3334 W.
+    shares = gateway.allocate_power({"A": 1.5, "B": 1.5, "C": 1.5}, 10.0, cfg)
+    assert shares == {"A": 3.333, "B": 3.333, "C": 3.333}
+    assert sum(gateway.watts_floor(kw) for kw in shares.values()) == 9999
+    # Weights that are not exact in binary still split exactly by their stored value.
+    shares = gateway.allocate_power({"A": 0.1, "B": 0.2}, 6.0, cfg)
+    assert shares == {"A": 2.0, "B": 4.0}
+
+
+def test_allocations_round_trip_to_the_same_watts(cfg):
+    for watts in range(0, 10001):
+        assert gateway.watts_floor(watts / 1000) == watts
 
 
 # ---------------------------------------------------------------- budget decision
@@ -192,10 +211,10 @@ def test_stale_floor_applies_even_when_building_was_full(cfg):
 
 def test_budget_peak_window_caps(cfg):
     d = gateway.decide_ev_budget(cfg, 0.0, 1.0, None, None, PEAK)
-    assert (d.budget_kw, d.cap_kw, d.cap_source) == (6.0, 6.0, "peak")
+    assert (d.budget_kw, d.cap_kw, d.cap_source) == (5.0, 5.0, "peak")
 
 def test_budget_peak_cap_does_not_raise_a_lower_budget(cfg):
-    assert gateway.decide_ev_budget(cfg, 470.0, 1.0, None, None, PEAK).budget_kw == 6.0
+    assert gateway.decide_ev_budget(cfg, 470.0, 1.0, None, None, PEAK).budget_kw == 5.0
     assert gateway.decide_ev_budget(cfg, 476.0, 1.0, None, None, PEAK).budget_kw == 4.0
 
 def test_budget_grid_signal_overrides_tariff(cfg):
@@ -206,7 +225,7 @@ def test_budget_grid_signal_overrides_tariff(cfg):
 
 def test_budget_old_grid_signal_falls_back_to_tariff(cfg):
     d = gateway.decide_ev_budget(cfg, 0.0, 1.0, 50.0, cfg.grid_signal_max_age_s + 1, PEAK)
-    assert (d.budget_kw, d.cap_source) == (6.0, "peak")
+    assert (d.budget_kw, d.cap_source) == (5.0, "peak")
     d = gateway.decide_ev_budget(cfg, 470.0, 1.0, 4.0, cfg.grid_signal_max_age_s + 1, OFF_PEAK)
     assert (d.budget_kw, d.cap_source) == (10.0, None)
 
@@ -249,8 +268,12 @@ def test_normal_allocation_converts_kw_to_watts(cfg):
     assert limit_of(gateway.build_charging_profile(1, 11.2, cfg)) == 11200.0
 
 def test_below_minimum_snaps_to_zero(cfg):
-    assert limit_of(gateway.build_charging_profile(1, 1.399, cfg)) == 0.0
-    assert limit_of(gateway.build_charging_profile(1, 1.4, cfg)) == 1400.0
+    assert limit_of(gateway.build_charging_profile(1, 1.4399, cfg)) == 0.0
+    assert limit_of(gateway.build_charging_profile(1, 1.44, cfg)) == 1440.0
+
+def test_profile_limit_rounds_down_to_whole_watts(cfg):
+    assert limit_of(gateway.build_charging_profile(1, 6.6669, cfg)) == 6666.0
+    assert limit_of(gateway.build_charging_profile(1, 1.4 * 3.0 / 3.0 + 0.04, cfg)) == 1440.0
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
 def test_non_finite_allocation_sends_zero(cfg, bad):
@@ -297,3 +320,81 @@ def test_invalid_profiles_refused(cfg, kwargs):
     connector_id = kwargs.pop("connector_id")
     with pytest.raises(ValueError):
         gateway.build_charging_profile(connector_id, 5.0, cfg, **kwargs)
+
+
+# ---------------------------------------------------------------- CT on the main feeder
+
+def test_other_load_is_ct_total_minus_ev_draw():
+    assert gateway.estimate_other_load_kw(486.666, [6.666, 10.0]) == pytest.approx(470.0)
+
+def test_other_load_never_negative():
+    assert gateway.estimate_other_load_kw(5.0, [6.0, 3.0]) == 0.0
+
+def test_other_load_with_no_cars_is_the_ct_reading():
+    assert gateway.estimate_other_load_kw(470.0, []) == 470.0
+
+
+# ---------------------------------------------------------------- transition-safe limits
+
+def safe(targets, committed, budget, reserved=0, priority=None, min_w=1440):
+    priority = priority or {k: 1.0 for k in targets}
+    return gateway.transition_safe_limits(targets, committed, budget, reserved, priority, min_w)
+
+def test_decreases_go_out_in_full_immediately():
+    assert safe({"A": 2000, "B": 0}, {"A": 10000, "B": 10000}, 2000) == {"A": 2000, "B": 0}
+
+def test_increase_waits_for_the_decrease_that_funds_it():
+    # A 6666 -> 3333 and B 3333 -> 6666: while A may still draw 6666, B cannot rise.
+    # (Only the 1 W that is genuinely free now, 10000 - 6666 - 3333, may go to B.)
+    assert safe({"A": 3333, "B": 6666}, {"A": 6666, "B": 3333}, 10000) == {"A": 3333, "B": 3334}
+    # Next cycle, A's decrease is confirmed: now B can rise.
+    assert safe({"A": 3333, "B": 6666}, {"A": 3333, "B": 3333}, 10000) == {"A": 3333, "B": 6666}
+
+def test_increases_served_by_priority_with_partial_grant():
+    result = safe({"A": 6000, "B": 6000}, {"A": 2000, "B": 2000}, 10000, priority={"A": 1.5, "B": 3.0})
+    assert result == {"A": 4000, "B": 6000}
+
+def test_partial_grant_below_minimum_is_not_given():
+    # 1000 W of headroom cannot start a stopped car (min 1440) but can lift a running one.
+    assert safe({"A": 5000}, {"A": 0}, 1000) == {"A": 0}
+    assert safe({"A": 5000, "B": 5000}, {"A": 0, "B": 2000}, 3000, priority={"A": 3.0, "B": 1.0}) == \
+        {"A": 0, "B": 3000}
+
+def test_reserved_power_is_not_handed_out():
+    assert safe({"A": 10000}, {"A": 0}, 10000, reserved=6666) == {"A": 3334}
+
+def test_over_committed_site_only_decreases():
+    assert safe({"A": 5000, "B": 5000}, {"A": 10000, "B": 1000}, 10000) == {"A": 5000, "B": 1000}
+
+def test_transition_safety_randomised():
+    """Whatever the starting point, nothing that is sent can push the worst case over
+    the budget, and nothing above a car's target is ever sent."""
+    rng = random.Random(99)
+    for _ in range(20000):
+        keys = [f"C{i}" for i in range(rng.randint(1, 10))]
+        budget = rng.randint(0, 100000)
+        reserved = rng.choice([0, rng.randint(0, 20000)])
+        committed = {k: rng.choice([0, 1440, rng.randint(0, 10000), 10000]) for k in keys}
+        targets = {k: rng.choice([0, rng.randint(1440, 10000)]) for k in keys}
+        priority = {k: rng.choice([0.5, 1.5, 3.0]) for k in keys}
+        result = gateway.transition_safe_limits(targets, committed, budget, reserved, priority, 1440)
+        worst_before = reserved + sum(committed.values())
+        # Worst case while the sends land: each car at the higher of old and new limit.
+        worst_during = reserved + sum(max(committed[k], result[k]) for k in keys)
+        assert worst_during <= max(worst_before, budget)
+        for k in keys:
+            assert result[k] <= max(targets[k], 0) or result[k] == committed[k]
+            if result[k] > committed[k]:
+                assert result[k] >= 1440 and result[k] <= targets[k]
+
+def test_other_load_rounds_up_to_whole_watts():
+    assert gateway.estimate_other_load_kw(470.0004, []) == 470.001
+    assert gateway.estimate_other_load_kw(480.0, [10.0000000000001]) == 470.0
+
+
+def test_tie_break_is_first_come_first_served(cfg):
+    weights = {"late": 1.5, "early": 1.5}
+    shares = gateway.allocate_power(weights, 2.0, cfg, arrival={"late": 100.0, "early": 5.0})
+    assert shares == {"late": 0.0, "early": 2.0}
+    shares = gateway.allocate_power(weights, 2.0, cfg, arrival={"late": 1.0, "early": 5.0})
+    assert shares == {"late": 2.0, "early": 0.0}

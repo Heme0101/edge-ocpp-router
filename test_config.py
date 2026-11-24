@@ -24,7 +24,9 @@ def with_change(section, key, value):
 def test_shipped_config_values():
     cfg = load_site_config()
     assert (cfg.panel_limit_kw, cfg.safety_margin_kw) == (600.0, 120.0)
-    assert (cfg.max_charger_kw, cfg.min_charger_kw) == (10.0, 1.4)
+    assert (cfg.max_charger_kw, cfg.min_charger_kw) == (10.0, 1.44)     # 6 A at 240 V (SAE J1772 minimum)
+    assert cfg.min_increase_w == 100.0 and cfg.meter_sample_interval_s == 5
+    assert cfg.peak_budget_cap_kw == 5.0
     assert (cfg.stale_floor_kw, cfg.telemetry_stale_after_s) == (2.0, 15.0)
     assert cfg.peak_windows == (PeakWindow(16 * 60, 21 * 60),)       # PG&E 4-9 PM
     assert cfg.timezone == "America/Los_Angeles"
@@ -82,7 +84,13 @@ def test_missing_section(tmp_path):
     ("chargers", "max_charger_kw", 0),
     ("chargers", "min_charger_kw", 11.0),         # above the max
     ("chargers", "min_charger_kw", 0),
-    ("chargers", "taper_threshold_w", 1400.0),    # would flag every car at the minimum
+    ("chargers", "taper_threshold_w", 1440.0),    # would flag every car at the minimum
+    ("chargers", "min_increase_w", 1440.0),       # a stopped car could never start
+    ("chargers", "min_increase_w", -1),
+    ("server", "meter_sample_interval_s", 0),
+    ("server", "meter_sample_interval_s", 15),    # not below the stale limit
+    ("server", "meter_sample_interval_s", 5.5),
+    ("server", "meter_sample_interval_s", True),
     ("chargers", "taper_grace_s", -1),
     ("telemetry", "stale_after_s", 0),
     ("telemetry", "stale_floor_kw", 1.0),         # below min: the stale floor would be 0 W

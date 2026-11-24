@@ -32,7 +32,11 @@ CALL, CALLRESULT, CALLERROR = 2, 3, 4
 HEARTBEAT_INTERVAL_S = 10
 PLUGGED_IN_STATUSES = {"Preparing", "Charging", "SuspendedEV", "SuspendedEVSE"}
 UNPLUGGED_STATUSES = {"Available", "Unavailable"}
+NOT_DRAWING_STATUSES = {"SuspendedEV", "SuspendedEVSE"}
+METER_MEASURANDS = ["Energy.Active.Import.Register", "Power.Active.Import", "Current.Import", "SoC"]
 COMPLETED_SESSIONS_KEPT = 1000
+HISTORY_KEPT = 64                           # per car: recent power readings / accepted limits
+OVERDRAW_SETTLE_S = 10.0                    # SAE J1772 gives an EV 5 s to follow a lower pilot
 
 
 class OcppError(Exception):
@@ -84,13 +88,18 @@ class Session:
     soc: float | None = None
     power_w: float | None = None
     power_at: float | None = None           # monotonic time of the last power reading
+    power_history: deque = field(default_factory=lambda: deque(maxlen=HISTORY_KEPT))   # (t, W)
+    limit_history: deque = field(default_factory=lambda: deque(maxlen=HISTORY_KEPT))   # (t, W) accepted
     current_a: float | None = None
-    limit_kw: float | None = None           # limit the charger last accepted for this car
-    limit_active_since: float | None = None  # when that limit last rose from 0 to >= min
+    accepted_w: int | None = None           # limit the charger last accepted (None: unknown)
+    inflight_w: int | None = None           # limit sent, answer not in yet
+    uncertain_w: int | None = None          # sent but never answered: may be in force
+    limit_active_since: float | None = None  # when the accepted limit last rose from 0 to >= min
     sent_purpose: str | None = None
-    sent_w: float | None = None
+    sent_w: int | None = None
     sent_at: float | None = None
     uncontrollable: bool = False            # rejected every limit: power reserved, alert raised
+    overdraw_reported: bool = False         # drew over its accepted limit (logged once)
     used_fallback: bool = False             # limited through ChargePointMaxProfile
 
     @property
@@ -130,7 +139,8 @@ class Charger:
     offline_since: float | None = None
     connectors: dict = field(default_factory=dict)      # connector_id -> Connector
     use_max_profile: bool = False           # TxProfile was rejected; limiting via ChargePointMax
-    max_profile_w: float | None = None
+    max_profile_w: int | None = None
+    needs_meter_config: bool = False        # push MeterValueSampleInterval/SampledData after boot
     max_profile_at: float | None = None
     busy: bool = False                      # a command exchange is still running
     pending: dict = field(default_factory=dict)         # message id -> Future
@@ -145,8 +155,11 @@ class Charger:
 @dataclass
 class Plan:
     decision: gateway.BudgetDecision
-    reserved_kw: float
-    allocations: dict                       # (charger_id, connector_id) -> kW
+    site_load_kw: float | None              # CT reading: the whole site, EVs included
+    other_load_kw: float | None             # everything that is not an EV
+    reserved_w: int                         # held for offline / uncontrollable cars
+    targets_w: dict                         # (charger_id, connector_id) -> W the car should get
+    send_w: dict                            # (charger_id, connector_id) -> W safe to send now
     sessions: dict                          # (charger_id, connector_id) -> Session
     tapered: set
 
@@ -156,8 +169,11 @@ class CentralSystem:
                  monotonic=time.monotonic, clock=utc_now):
         self.cfg = cfg
         self.chargers: dict[str, Charger] = {}
-        self.building_load_kw: float | None = None
+        self.site_load_kw: float | None = None             # main-feeder CT: EVs included
         self.last_meter_timestamp: float | None = None     # monotonic time of last CT reading
+        self._wake: asyncio.Event | None = None
+        self._over_panel = False
+        self._ct_negative = False
         self.grid_signal_cap_kw: float | None = None
         self.grid_signal_at: float | None = None
         self.completed_sessions = deque(maxlen=COMPLETED_SESSIONS_KEPT)
@@ -292,6 +308,7 @@ class CentralSystem:
         # A rebooted charger may have lost its profiles: start over with TxProfile and
         # re-send every limit.
         charger.use_max_profile = False
+        charger.needs_meter_config = charger_id != self.cfg.site_meter_id
         self._forget_sent_limits(charger)
         log.info("%s booted (%s %s)", charger_id, payload.get("chargePointVendor", "?"),
                  payload.get("chargePointModel", "?"))
@@ -378,8 +395,7 @@ class CentralSystem:
         session.charging_stopped = True
         session.transaction_stopped_at = self._clock()
         session.stop_reason = payload.get("reason", "Local")
-        session.power_w = 0.0
-        session.power_at = self._monotonic()
+        self._record_power(session, 0.0)
         charge_s = (session.transaction_stopped_at - session.transaction_started_at).total_seconds() \
             if session.transaction_started_at else 0.0
         log.info("%s transaction %d stopped (%s): %.3f kWh in %s", session.label, transaction_id,
@@ -393,7 +409,7 @@ class CentralSystem:
             raise OcppError("TypeConstraintViolation", "connectorId must be a whole number >= 0")
 
         if charger_id == self.cfg.site_meter_id:
-            self._record_building_load(reading)
+            self._record_site_load(reading)
             return {}
         if connector_id == 0:
             return {}                     # the charger's own main meter: not a car
@@ -431,12 +447,46 @@ class CentralSystem:
 
     # ---------------------------------------------------------------- readings and sessions
 
-    def _record_building_load(self, reading: MeterReading):
+    def _record_site_load(self, reading: MeterReading):
         if reading.power_w is None:
             log.warning("site meter sent MeterValues without a readable Power.Active.Import; ignored")
             return
-        self.building_load_kw = reading.power_w / 1000.0
+        self.site_load_kw = reading.power_w / 1000.0
         self.last_meter_timestamp = self._monotonic()
+        # Alerts are raised once per episode, not on every reading.
+        over_panel = self.site_load_kw > self.cfg.panel_limit_kw
+        if over_panel and not self._over_panel:
+            log.critical("CRITICAL ALERT: the site draws %.1f kW, above the %.1f kW panel limit; "
+                         "throttling EVs now", self.site_load_kw, self.cfg.panel_limit_kw)
+        elif self._over_panel and not over_panel:
+            log.warning("site back under the panel limit (%.1f kW)", self.site_load_kw)
+        self._over_panel = over_panel
+        negative = self.site_load_kw < 0.0
+        if negative and not self._ct_negative:
+            log.critical("CRITICAL ALERT: the main-feeder CT reads %.1f kW (negative). Either the "
+                         "clamp is installed backwards or the site is exporting power; neither can "
+                         "be trusted for load management, so the EV budget is 0 until it reads "
+                         "positive again", self.site_load_kw)
+        elif self._ct_negative and not negative:
+            log.warning("main-feeder CT reads positive again (%.1f kW)", self.site_load_kw)
+        self._ct_negative = negative
+        if self.site_load_kw > self.cfg.panel_limit_kw - self.cfg.safety_margin_kw:
+            self.wake_now()             # into the safety margin: don't wait for the next cycle
+
+    def wake_now(self):
+        """Run the next allocation cycle immediately."""
+        if self._wake is not None:
+            self._wake.set()
+
+    async def wait_for_next_cycle(self):
+        """Sleep one allocation interval, or less if wake_now() is called."""
+        if self._wake is None:
+            self._wake = asyncio.Event()
+        try:
+            await asyncio.wait_for(self._wake.wait(), self.cfg.allocation_interval_s)
+        except asyncio.TimeoutError:
+            pass
+        self._wake.clear()
 
     def _valid_soc(self, label, soc):
         if soc is None:
@@ -455,9 +505,23 @@ class CentralSystem:
         if reading.energy_wh is not None:
             session.record_energy(reading.energy_wh)
         if reading.power_w is not None:
-            session.power_w, session.power_at = reading.power_w, self._monotonic()
+            self._record_power(session, reading.power_w)
         if reading.current_a is not None:
             session.current_a = reading.current_a
+
+    def _record_power(self, session: Session, watts: float):
+        session.power_w, session.power_at = watts, self._monotonic()
+        session.power_history.append((session.power_at, watts))
+        # A charger that accepted a limit but keeps drawing well over it is not obeying.
+        # The site stays safe (its excess shows up in the CT reading as other load), but
+        # someone needs to know. Settling time: a car may take a few seconds to ramp down.
+        if session.accepted_w is not None and session.limit_history and not session.overdraw_reported:
+            since = session.power_at - session.limit_history[-1][0]
+            if since >= OVERDRAW_SETTLE_S and watts > session.accepted_w * 1.05 + 200:
+                session.overdraw_reported = True
+                log.error("%s draws %.0f W, over the %d W limit it accepted %.0f s ago; its "
+                          "excess is counted as other load", session.label, watts,
+                          session.accepted_w, since)
 
     def _find_transaction(self, charger: Charger, transaction_id: int) -> Session | None:
         for session in charger.sessions():
@@ -542,14 +606,9 @@ class CentralSystem:
         """Decide every car's power for this cycle. Sends nothing."""
         cfg, now = self.cfg, self._monotonic()
         self._expire_offline_sessions(now)
+        max_w = gateway.watts_floor(cfg.max_charger_kw)
 
-        telemetry_age = None if self.last_meter_timestamp is None else now - self.last_meter_timestamp
-        grid_age = None if self.grid_signal_at is None else now - self.grid_signal_at
-        decision = gateway.decide_ev_budget(cfg, self.building_load_kw, telemetry_age,
-                                            self.grid_signal_cap_kw, grid_age, self._clock())
-        self._log_budget_transitions(decision)
-
-        reserved_kw, sessions = 0.0, {}
+        reserved_w, sessions, ev_draws_kw = 0, {}, []
         for charger in self.chargers.values():
             if charger.charger_id == cfg.site_meter_id:
                 continue
@@ -557,20 +616,90 @@ class CentralSystem:
                 session = connector.session
                 if session is None or session.charging_stopped:
                     continue
+                if self.last_meter_timestamp is not None:
+                    ev_draws_kw.append(self._ev_draw_at_kw(session, connector, self.last_meter_timestamp))
                 if session.uncontrollable:
-                    reserved_kw += cfg.max_charger_kw   # it may draw anything up to the cap
+                    reserved_w += max_w                 # it may draw anything up to the cap
                 elif not charger.online:
-                    # Its last profile is still in force on the charger.
-                    reserved_kw += cfg.max_charger_kw if session.limit_kw is None else session.limit_kw
+                    reserved_w += self._committed_w(session)   # its last profile still applies
                 elif connector.status != "Faulted":
                     sessions[(charger.charger_id, connector_id)] = session
+
+        other_load_kw = None
+        if self.site_load_kw is not None and self.site_load_kw < 0.0:
+            # Backwards clamp or export: a negative load makes available_ev_budget_kw
+            # return 0 (see the alert in _record_site_load).
+            other_load_kw = self.site_load_kw
+        elif self.site_load_kw is not None:
+            other_load_kw = gateway.estimate_other_load_kw(self.site_load_kw, ev_draws_kw)
+        telemetry_age = None if self.last_meter_timestamp is None else now - self.last_meter_timestamp
+        grid_age = None if self.grid_signal_at is None else now - self.grid_signal_at
+        decision = gateway.decide_ev_budget(cfg, other_load_kw, telemetry_age,
+                                            self.grid_signal_cap_kw, grid_age, self._clock())
+        self._log_budget_transitions(decision)
 
         weights = {key: gateway.session_weight(s.soc, s.kwh_delivered) for key, s in sessions.items()}
         tapered = {key for key, s in sessions.items() if self._is_tapered(s, now)}
         caps = {key: cfg.min_charger_kw for key in tapered}
-        allocatable_kw = max(0.0, decision.budget_kw - reserved_kw)
-        allocations = gateway.allocate_power(weights, allocatable_kw, cfg, caps)
-        return Plan(decision, reserved_kw, allocations, sessions, tapered)
+        budget_w = gateway.watts_floor(decision.budget_kw)
+        arrival = {key: s.plugged_in_mono for key, s in sessions.items()}
+        allocations = gateway.allocate_power(weights, max(0, budget_w - reserved_w) / 1000, cfg, caps,
+                                             arrival)
+        targets_w = {key: gateway.watts_floor(kw) for key, kw in allocations.items()}
+        committed_w = {key: self._committed_w(s) for key, s in sessions.items()}
+        send_w = gateway.transition_safe_limits(targets_w, committed_w, budget_w, reserved_w, weights,
+                                                gateway.watts_ceil(cfg.min_charger_kw))
+        return Plan(decision, self.site_load_kw, other_load_kw, reserved_w, targets_w, send_w,
+                    sessions, tapered)
+
+    def _ev_draw_at_kw(self, session: Session, connector: Connector, t_ct: float) -> float:
+        """A LOWER BOUND on this car's draw at the instant the CT reading was taken (t_ct).
+
+        The CT and the chargers report at different instants, so readings are paired by
+        time, and every uncertainty is resolved toward under-counting EV power (a bigger
+        "other loads", so a smaller EV budget, never a larger one):
+        - the car's last reading at or before t_ct is the basis; with none, 0 (a car that
+          only started drawing after t_ct is not in the CT reading at all);
+        - a lower reading just after t_ct is used instead (the car may have stopped on its
+          own), unless a new limit was accepted in between: then the drop is our own cut,
+          which happened after t_ct, and the CT reading still contains the old draw;
+        - capped by the limit in force at t_ct (a car still ramping down after a cut only
+          counts its new limit), or by max_charger_kw when no limit is known (so a
+          garbage reading such as 1e9 W cannot wipe out the other loads);
+        - 0 when the car reports it is not drawing (SuspendedEV / SuspendedEVSE).
+        """
+        if connector.status in NOT_DRAWING_STATUSES:
+            return 0.0
+        window = self.cfg.telemetry_stale_after_s
+        before = after = None
+        for t, watts in session.power_history:              # oldest first
+            if t <= t_ct:
+                if t_ct - t <= window:
+                    before = (t, watts)
+            elif after is None and t - t_ct <= window:
+                after = (t, watts)
+        if before is None:
+            return 0.0
+        draw_w = max(0.0, before[1])
+        limit = None
+        cut_between = False
+        for t, limit_w in session.limit_history:
+            if t <= t_ct:
+                limit = limit_w                             # the last limit accepted before t_ct
+            elif after is not None and t <= after[0]:
+                cut_between = True
+        if after is not None and not cut_between:
+            draw_w = min(draw_w, max(0.0, after[1]))
+        if limit is None:
+            limit = gateway.watts_floor(self.cfg.max_charger_kw)
+        return min(draw_w, limit) / 1000.0
+
+    def _committed_w(self, session: Session) -> int:
+        """The most this car may be drawing right now: its accepted limit, or a higher one
+        that was sent and may already be in force. Unknown -> max_charger_kw."""
+        committed = gateway.watts_floor(self.cfg.max_charger_kw) if session.accepted_w is None \
+            else session.accepted_w
+        return max(committed, session.inflight_w or 0, session.uncertain_w or 0)
 
     def _is_tapered(self, session: Session, now: float) -> bool:
         """Allowed to charge for at least taper_grace_s, yet drawing (almost) nothing."""
@@ -596,7 +725,7 @@ class CentralSystem:
                             "held to the %.1f kW safe floor", self.cfg.telemetry_stale_after_s,
                             self.cfg.stale_floor_kw)
             elif self._was_stale is not None:
-                log.info("building load telemetry restored (%.1f kW)", self.building_load_kw)
+                log.info("site CT telemetry restored (%.1f kW)", self.site_load_kw)
             self._was_stale = decision.telemetry_stale
         if decision.cap_source != self._last_cap_source:
             if decision.cap_source == "grid":
@@ -613,19 +742,19 @@ class CentralSystem:
         tasks; each charger is handled independently, so a slow or silent charger never
         delays the others or the next cycle."""
         plan = self.plan()
-        if plan.sessions or plan.reserved_kw:
+        if plan.sessions or plan.reserved_w:
             log.info(self._summary(plan))
 
-        by_charger: dict[str, dict[int, float]] = {}
-        for (charger_id, connector_id), kw in plan.allocations.items():
-            by_charger.setdefault(charger_id, {})[connector_id] = kw
+        by_charger: dict[str, dict[int, int]] = {}
+        for (charger_id, connector_id), watts in plan.send_w.items():
+            by_charger.setdefault(charger_id, {})[connector_id] = watts
 
         tasks = []
         for charger_id, charger in self.chargers.items():
             if charger_id == self.cfg.site_meter_id or not charger.online or charger.busy:
                 continue
             allocations = by_charger.get(charger_id, {})
-            if not allocations and not charger.use_max_profile:
+            if not allocations and not charger.use_max_profile and not charger.needs_meter_config:
                 continue
             charger.busy = True
             task = asyncio.create_task(self._apply(charger, allocations))
@@ -637,61 +766,73 @@ class CentralSystem:
     def _summary(self, plan: Plan) -> str:
         d = plan.decision
         if d.telemetry_stale:
-            head = f"EV budget {d.budget_kw:.1f} kW [STALE CT telemetry: safe floor]"
+            head = f"EV budget {d.budget_kw:.3f} kW [STALE CT telemetry: safe floor]"
         else:
-            head = f"EV budget {d.budget_kw:.1f} kW [building {self.building_load_kw:.1f} kW]"
+            head = (f"EV budget {d.budget_kw:.3f} kW [site {plan.site_load_kw:.1f} kW, "
+                    f"other loads {plan.other_load_kw:.1f} kW]")
         if d.cap_source == "grid":
             head += f" [grid cap {d.cap_kw:.1f} kW]"
         elif d.cap_source == "peak":
             head += f" [peak cap {d.cap_kw:.1f} kW]"
-        if plan.reserved_kw:
-            head += f" [{plan.reserved_kw:.1f} kW reserved: offline/uncontrolled]"
+        if plan.reserved_w:
+            head += f" [{plan.reserved_w / 1000:.3f} kW reserved: offline/uncontrolled]"
         now = self._monotonic()
         parts = []
         for key, session in sorted(plan.sessions.items()):
             level = f"{session.soc:.1f}%" if session.soc is not None else f"{session.kwh_delivered:.2f} kWh in"
-            watts = round(plan.allocations[key] * 1000)
+            sent, target = plan.send_w[key], plan.targets_w[key]
+            limit = f"{sent} W" if sent == target else f"{sent} W (ramping to {target} W)"
             tag = " tapered" if key in plan.tapered else ""
-            parts.append(f"{session.label} {level} -> {watts} W{tag} "
+            parts.append(f"{session.label} {level} -> {limit}{tag} "
                          f"({format_duration(now - session.plugged_in_mono)})")
         return " | ".join([head] + parts)
 
     async def _apply(self, charger: Charger, allocations: dict):
         try:
+            # Limits first (safety), then the one-off meter configuration. Everything runs
+            # in this one task, so the charger never has two of our CALLs outstanding,
+            # as OCPP-J requires.
             if charger.use_max_profile:
                 await self._apply_max_profile(charger, allocations)
-                return
-            for connector_id, kw in allocations.items():
-                await self._apply_connector(charger, connector_id, kw, allocations)
-                if charger.use_max_profile or not charger.online:
-                    break                   # switched to ChargePointMax, or the charger left
+            else:
+                for connector_id, watts in allocations.items():
+                    await self._apply_connector(charger, connector_id, watts, allocations)
+                    if charger.use_max_profile or not charger.online:
+                        break               # switched to ChargePointMax, or the charger left
+            if charger.needs_meter_config and charger.online:
+                await self._configure_metering(charger)
         except Exception:
             log.exception("%s: error while sending limits", charger.charger_id)
         finally:
             charger.busy = False
 
     def _needs_send(self, purpose, watts, sent_purpose, sent_w, sent_at) -> bool:
-        return (sent_w is None or sent_purpose != purpose or sent_w != watts
-                or self._monotonic() - sent_at >= self.cfg.profile_refresh_s)
+        """Send when it matters, skip the chatter. No hysteresis band:
+        - any decrease, of even 1 W, goes out at once (safety: never wait to cut power);
+        - an increase goes out once it reaches min_increase_w (smaller ones only add network
+          traffic; holding the lower value is always safe);
+        - an unchanged or skipped value is refreshed every profile_refresh_s."""
+        if sent_w is None or sent_purpose != purpose or watts < sent_w:
+            return True
+        if watts - sent_w >= self.cfg.min_increase_w:
+            return True
+        return self._monotonic() - sent_at >= self.cfg.profile_refresh_s
 
-    async def _apply_connector(self, charger, connector_id, kw, allocations):
+    async def _apply_connector(self, charger, connector_id, watts, allocations):
         session = charger.connector(connector_id).session
         if session is None or session.charging_stopped or session.uncontrollable:
             return                          # changed while earlier commands were in flight
         purpose = gateway.TX_PROFILE if session.transaction_id is not None else gateway.TX_DEFAULT_PROFILE
-        message = gateway.build_charging_profile(connector_id, kw, self.cfg, purpose,
+        message = gateway.build_charging_profile(connector_id, watts / 1000, self.cfg, purpose,
                                                  session.transaction_id)
-        watts = gateway.profile_limit_w(message)
+        watts = int(gateway.profile_limit_w(message))       # 0 if below the minimum
         if not self._needs_send(purpose, watts, session.sent_purpose, session.sent_w, session.sent_at):
             return
-        try:
-            status = await self._send_profile(charger, message)
-        except NoResponse as error:
-            log.warning("%s did not answer SetChargingProfile (%s); retrying next cycle",
-                        session.label, error)
-            return
+        status = await self._send_tracked(charger, message, {connector_id: watts}, "SetChargingProfile")
+        if status is None:
+            return                          # no answer: retried next cycle
         if status == "Accepted":
-            self._record_limit(session, watts / 1000.0)
+            self._record_limit(session, watts)
             session.sent_purpose, session.sent_w, session.sent_at = purpose, watts, self._monotonic()
             return
 
@@ -709,8 +850,7 @@ class CentralSystem:
             await self._escalate(charger, session, f"{purpose} {status}, ChargePointMaxProfile rejected")
 
     async def _apply_max_profile(self, charger, allocations):
-        total_kw = sum(allocations.values())
-        watts = round(total_kw * 1000, 1)
+        watts = sum(allocations.values())
         if not self._needs_send(gateway.CHARGE_POINT_MAX_PROFILE, watts, gateway.CHARGE_POINT_MAX_PROFILE,
                                 charger.max_profile_w, charger.max_profile_at):
             return
@@ -725,27 +865,50 @@ class CentralSystem:
                     await self._escalate(charger, session, "ChargePointMaxProfile rejected")
 
     async def _send_max_profile(self, charger, allocations) -> bool | None:
-        """ChargePointMaxProfile for the whole charger = the sum of its cars' allocations.
-        True accepted, False refused, None no answer."""
-        message = gateway.build_charging_profile(0, sum(allocations.values()), self.cfg,
+        """ChargePointMaxProfile for the whole charger = the sum of its cars' limits (whole
+        watts, so the sum is exact). True accepted, False refused, None no answer."""
+        message = gateway.build_charging_profile(0, sum(allocations.values()) / 1000, self.cfg,
                                                  gateway.CHARGE_POINT_MAX_PROFILE,
                                                  start_schedule=self._clock())
-        watts = gateway.profile_limit_w(message)
-        try:
-            status = await self._send_profile(charger, message)
-        except NoResponse as error:
-            log.warning("%s did not answer ChargePointMaxProfile (%s); retrying next cycle",
-                        charger.charger_id, error)
+        status = await self._send_tracked(charger, message, allocations, "ChargePointMaxProfile")
+        if status is None:
             return None
         if status != "Accepted":
             log.warning("%s answered %s to ChargePointMaxProfile", charger.charger_id, status)
             return False
-        charger.max_profile_w, charger.max_profile_at = watts, self._monotonic()
-        for connector_id, kw in allocations.items():
+        charger.max_profile_w = int(gateway.profile_limit_w(message))
+        charger.max_profile_at = self._monotonic()
+        for connector_id, watts in allocations.items():
             session = charger.connector(connector_id).session
             if session is not None:
-                self._record_limit(session, kw)
+                self._record_limit(session, watts)
         return True
+
+    async def _send_tracked(self, charger, message, limits_w: dict, what: str) -> str | None:
+        """Send a profile while counting its limits as possibly in force (in flight), so no
+        other car is given that headroom meanwhile. No answer -> None, and the limits stay
+        counted as possibly in force until a later answer settles them."""
+        sessions = {cid: charger.connector(cid).session for cid in limits_w}
+        for connector_id, session in sessions.items():
+            if session is not None:
+                session.inflight_w = limits_w[connector_id]
+        try:
+            status = await self._send_profile(charger, message)
+        except NoResponse as error:
+            log.warning("%s did not answer %s (%s); retrying next cycle", charger.charger_id, what, error)
+            for connector_id, session in sessions.items():
+                if session is not None:
+                    session.uncertain_w = max(session.uncertain_w or 0, limits_w[connector_id])
+            return None
+        finally:
+            for session in sessions.values():
+                if session is not None:
+                    session.inflight_w = None
+        if status == "Accepted":
+            for session in sessions.values():
+                if session is not None:
+                    session.uncertain_w = None
+        return status
 
     async def _send_profile(self, charger, message) -> str:
         """'Accepted', 'Rejected', 'NotSupported', or 'CALLERROR <code>'. Raises NoResponse."""
@@ -756,13 +919,46 @@ class CentralSystem:
         status = response.get("status") if isinstance(response, dict) else None
         return status if isinstance(status, str) else "an invalid reply"
 
-    def _record_limit(self, session: Session, kw: float):
-        if kw >= self.cfg.min_charger_kw:
-            if session.limit_kw is None or session.limit_kw < self.cfg.min_charger_kw:
+    def _record_limit(self, session: Session, watts: int):
+        min_w = gateway.watts_ceil(self.cfg.min_charger_kw)
+        if watts >= min_w:
+            if session.accepted_w is None or session.accepted_w < min_w:
                 session.limit_active_since = self._monotonic()
         else:
             session.limit_active_since = None
-        session.limit_kw = kw
+        session.accepted_w = watts
+        session.limit_history.append((self._monotonic(), watts))
+
+    async def _configure_metering(self, charger: Charger):
+        """Ask the charger for frequent power readings: the EV share of the CT reading can
+        only be subtracted when a charger's reading is fresh (OCPP 1.6 standard keys)."""
+        settings = [("MeterValueSampleInterval", str(self.cfg.meter_sample_interval_s)),
+                    ("MeterValuesSampledData", ",".join(METER_MEASURANDS))]
+        for key, value in settings:
+            status = await self._change_configuration(charger, key, value)
+            if key == "MeterValuesSampledData" and status not in (None, "Accepted", "RebootRequired"):
+                # Most AC chargers cannot read the car's SoC; ask again without it.
+                status = await self._change_configuration(charger, key, ",".join(METER_MEASURANDS[:-1]))
+            if status is None:
+                return                      # no answer: try again next cycle
+            if status == "RebootRequired":
+                log.warning("%s needs a reboot to apply %s=%s", charger.charger_id, key, value)
+            elif status != "Accepted":
+                log.warning("%s answered %s to %s=%s; its power readings may be too infrequent "
+                            "for the EV share of the CT reading to be subtracted",
+                            charger.charger_id, status, key, value)
+        charger.needs_meter_config = False
+
+    async def _change_configuration(self, charger, key, value) -> str | None:
+        message = [CALL, str(uuid.uuid4()), "ChangeConfiguration", {"key": key, "value": value}]
+        try:
+            response = await self.call(charger, message)
+        except NoResponse:
+            return None
+        except CallFailed as error:
+            return f"CALLERROR {error.code}"
+        status = response.get("status") if isinstance(response, dict) else None
+        return status if isinstance(status, str) else "an invalid reply"
 
     async def _escalate(self, charger: Charger, session: Session, why: str):
         """Last resort: the charger refuses every limit, so its car is stopped."""
@@ -875,7 +1071,7 @@ async def handle_connection(cs: CentralSystem, connections: dict, ws):
 async def allocation_loop(cs: CentralSystem):
     """Runs forever. A failure in one cycle is logged and the next cycle runs as usual."""
     while True:
-        await asyncio.sleep(cs.cfg.allocation_interval_s)
+        await cs.wait_for_next_cycle()
         try:
             await cs.run_cycle()
         except Exception:

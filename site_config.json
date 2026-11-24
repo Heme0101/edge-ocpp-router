@@ -7,7 +7,8 @@
   },
   "chargers": {
     "max_charger_kw": 10.0,
-    "min_charger_kw": 1.4,
+    "min_charger_kw": 1.44,
+    "min_increase_w": 100.0,
     "taper_threshold_w": 100.0,
     "taper_grace_s": 30.0,
     "offline_session_timeout_s": 300.0
@@ -20,7 +21,7 @@
     "peak_windows": [
       {"start": "16:00", "end": "21:00"}
     ],
-    "peak_budget_cap_kw": 6.0
+    "peak_budget_cap_kw": 5.0
   },
   "grid_signal": {
     "enabled": false,
@@ -33,6 +34,7 @@
     "allocation_interval_s": 2.0,
     "profile_refresh_s": 30.0,
     "call_timeout_s": 10.0,
+    "meter_sample_interval_s": 5,
     "session_log_path": "sessions.jsonl"
   }
 }
