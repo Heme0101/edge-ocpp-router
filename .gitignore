@@ -4,4 +4,4 @@ __pycache__/
 .pytest_cache/
 .env
 *.log
-.vscode/
+.vscode/sessions.jsonl
