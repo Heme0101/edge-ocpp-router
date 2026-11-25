@@ -1,12 +1,22 @@
 {
   "site": {
-    "panel_limit_kw": 600.0,
-    "safety_margin_kw": 120.0,
+    "panel_limit_kw": 100.0,
+    "safety_margin_kw": 20.0,
     "site_meter_id": "SITE_METER",
     "timezone": "America/Los_Angeles"
   },
+  "electrical_service": {
+    "voltage_v": 208.0,
+    "phases": 3,
+    "main_breaker_a": 400.0,
+    "breaker_100_percent_rated": false,
+    "transformer_kva": 150.0,
+    "min_power_factor": 0.9
+  },
   "chargers": {
-    "max_charger_kw": 10.0,
+    "voltage_v": 208.0,
+    "max_current_a": 32.0,
+    "max_charger_kw": 6.656,
     "min_charger_kw": 1.44,
     "min_increase_w": 100.0,
     "taper_threshold_w": 100.0,
@@ -15,7 +25,8 @@
   },
   "telemetry": {
     "stale_after_s": 15.0,
-    "stale_floor_kw": 2.0
+    "stale_floor_kw": 2.0,
+    "ct_accuracy_pct": 1.0
   },
   "tariff": {
     "peak_windows": [

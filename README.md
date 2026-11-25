@@ -9,6 +9,28 @@ go out immediately, and it never hands out power that a car might still be using
 Built for sites where the panel is the constraint: commercial buildings, parking lots,
 fleet depots, and landlord/HOA buildings.
 
+## Reference site
+
+`site_config.json` describes a realistic small building: a small commercial or HOA
+building with six Level-2 chargers in its parking area. The config records the physical
+equipment, and the server refuses to start if a kW setting is more than that equipment
+can carry.
+
+| | Value | Where the number comes from |
+|---|---|---|
+| Utility transformer | 150 kVA | Pad-mount, sized above the service |
+| Service | 208Y/120 V, 3-phase, 400 A main breaker (standard, 80 %-rated) | 208 × 400 × √3 = 144.1 kVA |
+| Continuous capacity | 103.8 kW | 80 % of 144.1 kVA = 115.3 kVA (the transformer is larger), × 0.9 worst power factor |
+| `panel_limit_kw` | **100 kW** | Below the continuous capacity |
+| `safety_margin_kw` | **20 kW** | ≥ largest load step (15 kW HVAC compressor) + CT noise + CT accuracy |
+| Usable for the building + EVs | 80 kW | 100 − 20 |
+| Building load | 55 kW base, +15 kW when the HVAC compressor runs | → EV budget about 25 kW / 10 kW |
+| Chargers | 6 × Level 2, 32 A at 208 V on 40 A breakers | 6.656 kW each, 40 kW if all ran flat out |
+| `min_charger_kw` | 1.44 kW | 6.9 A at 208 V, above the SAE J1772 6 A minimum (1.248 kW) |
+
+The six chargers could draw 40 kW, but the building only leaves 10–25 kW. That gap is
+why this router exists: without it, the site would need a bigger service.
+
 ## Architecture
 
 ```mermaid
@@ -51,15 +73,28 @@ venv/bin/python server.py
 venv/bin/python sim_chargers.py
 ```
 
-The simulator's other loads are 470 kW, so the EV budget is 600 − 470 − 120 = 10 kW:
+The simulator starts six chargers. They boot, accept the 0 W default for new sessions,
+and their cars plug in at random moments over the first 20 s:
 
 ```
-[CP_1 | 22.0% SoC] Received limit: 6666.0 W
-[CP_2 | 67.0% SoC] Received limit: 3333.0 W
+[CP_1 | 15.0% SoC] Default limit for new sessions: 0.0 W
+...
+[CP_1 | 15.0% SoC] Received limit: 6250.0 W
 ```
+
+The building's base load is 55 kW, so the EV budget is 80 − 55 = 25 kW. The cars below 30 %
+and the car without SoC get 6250 W each, the cars at 48 % and 67 % get 3125 W each, and the
+85 % car waits (its 1.0 kW share is under the 1.44 kW minimum). Every 60 s the HVAC
+compressor adds 15 kW. The budget then drops to 10 kW within one CT reading: the three
+priority cars get 3333 W each and the others pause. When the compressor stops, they all
+resume.
 
 Between **16:00 and 21:00 site time** (the PG&E peak window), the budget is capped at
-`peak_budget_cap_kw` (5.0 kW). During that window, you will see 3333 W / 1666 W instead.
+`peak_budget_cap_kw` (5.0 kW): the three priority cars get 1666 W each and the others wait.
+
+At startup the server logs `waiting for the first CT reading from SITE_METER` (INFO)
+until the simulator connects. It warns only if no reading has arrived after
+`stale_after_s` (15 s), or if readings stop.
 
 Run the tests (no internet needed; the end-to-end tests use loopback only):
 
@@ -71,8 +106,12 @@ venv/bin/pytest -q
 
 | Option | Effect |
 |---|---|
-| `--cars CP_1:22,CP_2:67,CP_3:none` | Chargers and starting SoC. `none` = a J1772 car that reports no SoC (weighted by kWh delivered). |
-| `--building-load-kw 470` | The site's other loads. The simulated CT reports these **plus** what the cars draw. |
+| `--cars CP_1:15,...,CP_5:none,CP_6:85` | Chargers and starting SoC. `none` = a J1772 car that reports no SoC (weighted by kWh delivered). |
+| `--building-load-kw 55` | The building's base load. The simulated CT reports the total: base + HVAC + noise + **what the cars draw**. |
+| `--hvac-kw 15 --hvac-period 60` | An HVAC compressor that runs 60 s on, 60 s off. |
+| `--noise-pct 2` | Each CT reading varies by up to ±2 % of the base load. |
+| `--arrival-spread 20` | Cars plug in at random times within 20 s of startup (0 = all at once). |
+| `--charger-kw 6.656` | Each charger's hardware rating (defaults from `site_config.json`). |
 | `--ct-interval 1` | Seconds between CT readings. |
 | `--reject-tx CP_2` | CP_2 rejects TxProfile, so the server falls back to ChargePointMaxProfile. |
 | `--reject-all CP_2` | CP_2 rejects every profile, so the server sends RemoteStopTransaction and raises a CRITICAL alert. |
@@ -84,8 +123,7 @@ venv/bin/pytest -q
 1. **Measure the other loads.** The CT clamp on the main feeder measures the whole site,
    **EVs included**. So: *other loads = CT reading − what the EVs drew at that instant*.
    The CT and the chargers report at different moments, so each car's draw is paired
-   with the CT reading by time. Every uncertainty is resolved toward **under-counting**
-   the EVs, which over-counts the other loads and gives a smaller EV budget:
+   with the CT reading by time and bounded from below and above:
    * The car's last power reading at or before the CT reading is used. With none, the
      car counts as 0, because a car that only started afterwards is not in that reading.
    * A lower reading just afterwards is used instead (the car may have stopped by
@@ -95,7 +133,23 @@ venv/bin/pytest -q
      after a cut only counts its new limit. With no known limit, it is capped at
      `max_charger_kw`, so a garbage value such as 1e9 W can't wipe out the other loads.
    * A car whose charger reports SuspendedEV/SuspendedEVSE counts as 0.
-   * The result is rounded **up** to whole watts.
+   * **The upper bound.** Right after a limit change, a car may or may not have followed
+     yet, so its draw lies between its last reading and its new limit. That window is the
+     J1772 response time (5 s) plus one meter-sample interval.
+
+   The other loads are therefore known to lie in a band. The previous estimate is kept,
+   **clamped into that band**:
+   * A CT rise fully explained by our own raise changes nothing. Without this, the server
+     would mistake its own raise for building load and cut the cars, and they would flip
+     on and off every cycle.
+   * A CT move the cars cannot explain moves the estimate at once.
+   * When all readings are current, the band is a single value, so the estimate is exact
+     with no lag.
+   * A charger that never reports power stops widening the band once that window
+     passes, so it cannot hide a real load increase. Its draw then counts as other load,
+     which is the safe side.
+
+   The result is rounded **up** to whole watts.
 2. **Building budget** = `panel_limit_kw − other loads − safety_margin_kw`, never negative,
    rounded **down** to whole watts.
 3. **Bad CT data.**
@@ -128,10 +182,21 @@ venv/bin/pytest -q
 
 ## Throttling sharply without tripping a breaker
 
-* **Cuts are immediate.** A decrease of even 1 W is sent on the cycle it is computed, to
-  all chargers in parallel, with no deadband and no hysteresis. A charger still
-  answering a previous message gets it on the next cycle. Meanwhile, its old limit stays
-  counted as committed.
+* **New cars start at 0 W.** When a charger boots or connects, the server installs a
+  **TxDefaultProfile on connector 0 at 0 W**: every new session starts there, not at the
+  charger's full hardware default. Plugging in triggers an immediate cycle, so the car
+  gets its own limit within milliseconds. Without this, cars arriving together would all
+  draw full power before their first limit arrived. In testing, six cars at once pushed
+  the site 9 kW over the panel limit. The default has its own profile id and stack
+  level, so it never replaces a per-car profile.
+* **Cuts are immediate.** A cut is sent on the cycle it is computed, to all chargers in
+  parallel. A charger still answering a previous message gets it on the next cycle;
+  meanwhile, its old limit stays counted as committed. The only exception is cuts too
+  small for the CT to resolve (below its accuracy, `ct_accuracy_pct`): they may be held,
+  smallest first, as long as the total held across the **whole site** stays within that
+  accuracy (800 W here). Anything bigger goes out at once, including any cut that stops a
+  car. Otherwise every charger would get a message on every reading, chasing
+  measurement noise.
 * **Raises only from real headroom.** A charger only lowers its draw once it has
   accepted a new limit. Until then, each car is counted at its *committed* power: its
   accepted limit, any higher limit still in flight, or one that was sent and never
@@ -139,15 +204,25 @@ venv/bin/pytest -q
   priority first, only from headroom that exists while every car still draws its
   committed power. Moving power from car A to car B therefore takes two cycles: A's
   cut, then B's raise once A has confirmed. At no point can the worst case exceed the
-  budget. The tests check this property over 20,000 random situations and through
+  budget, plus at most the small cuts held within CT accuracy (below). The tests check this property over 20,000 random situations and through
   300 cycles of a busy site.
 * **No waiting when the site is over.** A CT reading above `panel_limit_kw −
   safety_margin_kw` starts a cycle immediately instead of waiting for the next one.
-  In the end-to-end test, with random load jumps, the longest time over the limit was
-  one CT sample plus one round trip (under 0.1 s).
+  In the end-to-end stress test, the building load jumped randomly every 0.4 s. The
+  overshoot never exceeded the size of the jump itself (the part no controller can
+  prevent), and it lasted at most one car-reading interval. That's the case where a
+  building jump coincides with one of the server's own raises and can't be told apart
+  until the cars' next reading.
 * **Less network chatter, safely.** A raise smaller than `min_increase_w` (100 W) is not
-  sent, because holding the lower value is always safe. Cuts are never held back.
-  Unchanged limits are refreshed every `profile_refresh_s` (30 s).
+  sent, because holding the lower value is always safe. Small cuts follow the site-wide
+  accuracy rule above. Unchanged limits are refreshed every `profile_refresh_s` (30 s).
+  On the reference site with a noisy CT, this halved the limit messages, with no on/off
+  flapping.
+* **Sizing the safety margin.** A load that switches on between two CT readings
+  overshoots by its own size before any controller can react. So `safety_margin_kw`
+  must be at least the **largest single load step** (here, the 15 kW HVAC compressor)
+  plus CT noise and accuracy. With a 10 kW margin and a 15 kW compressor, testing showed
+  the site reaching 102.4 kW for one second. With 20 kW, it never passed 95 kW.
 * **Fresh readings.** After each boot, the server sets the charger's
   `MeterValueSampleInterval` and `MeterValuesSampledData` (standard OCPP 1.6 keys), so
   power readings arrive often enough to pair with the CT. If a charger cannot sample
@@ -187,18 +262,25 @@ server at startup with a message naming the key.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `site.panel_limit_kw` | 600.0 | Most the whole site may draw **continuously** (see the codes below). |
-| `site.safety_margin_kw` | 120.0 | Kept free below the limit (usable: 480 kW). |
+| `site.panel_limit_kw` | 100.0 | Most the whole site may draw **continuously**. Checked against `electrical_service`. |
+| `site.safety_margin_kw` | 20.0 | Kept free below the limit (usable: 80 kW). At least the largest load step + CT accuracy. |
 | `site.site_meter_id` | `SITE_METER` | Connection id of the main-feeder CT meter. |
 | `site.timezone` | `America/Los_Angeles` | Site time for the peak windows (DST handled). |
-| `chargers.max_charger_kw` | 10.0 | Most one car may get. |
-| `chargers.min_charger_kw` | 1.44 | Smallest limit sent other than 0: 6 A at 240 V (6.9 A at 208 V). |
+| `electrical_service.voltage_v` / `phases` | 208 / 3 | The service. |
+| `electrical_service.main_breaker_a` | 400 | Main breaker rating. |
+| `electrical_service.breaker_100_percent_rated` | false | A standard breaker carries 80 % continuously; a 100 %-rated one carries 100 %. |
+| `electrical_service.transformer_kva` | 150 | Utility transformer. |
+| `electrical_service.min_power_factor` | 0.9 | Worst expected power factor: breakers limit current (kVA); the CT reports kW. |
+| `chargers.voltage_v` / `max_current_a` | 208 / 32 | Charger supply and rating; `max_charger_kw` may not exceed their product. |
+| `chargers.max_charger_kw` | 6.656 | Most one car may get (32 A × 208 V). |
+| `chargers.min_charger_kw` | 1.44 | Smallest limit sent other than 0. Must be ≥ 6 A × `voltage_v` (SAE J1772). |
 | `chargers.min_increase_w` | 100.0 | Raises smaller than this are not sent (cuts always are). |
 | `chargers.taper_threshold_w` | 100.0 | Below this measured draw, a car counts as tapered. |
 | `chargers.taper_grace_s` | 30.0 | Ramp-up time before a car can count as tapered. |
 | `chargers.offline_session_timeout_s` | 300.0 | How long an offline charger's limit stays reserved. |
 | `telemetry.stale_after_s` | 15.0 | CT reading age after which the budget drops to the floor. |
-| `telemetry.stale_floor_kw` | 2.0 | Total EV budget on stale telemetry (~8.3 A at 240 V). |
+| `telemetry.stale_floor_kw` | 2.0 | Total EV budget on stale telemetry (~9.6 A at 208 V). |
+| `telemetry.ct_accuracy_pct` | 1.0 | The CT meter's accuracy class. Cuts within it may be held, site-wide (800 W here). |
 | `tariff.peak_windows` | 16:00–21:00 | Daily windows, site time; `end` < `start` wraps past midnight. |
 | `tariff.peak_budget_cap_kw` | 5.0 | EV budget cap inside a peak window. |
 | `grid_signal.enabled` | false | Run the grid signal poller. |
@@ -217,15 +299,17 @@ This is engineering guidance, not legal advice. The authority having jurisdictio
 (AHJ), the utility and a licensed electrician decide what applies to a given site.
 
 * **EV charging is a continuous load (NEC Article 625).** A standard (non-100 %-rated)
-  breaker may carry at most 80 % of its rating continuously. Set `panel_limit_kw` to the
-  service's continuous rating, not to its breaker rating.
+  breaker may carry at most 80 % of its rating continuously. The config enforces this:
+  `panel_limit_kw` may not exceed the service's continuous capacity, computed from
+  `electrical_service`.
 * **Load management (NEC 625.42, Article 750).** The NEC allows an automatic load
   management system to limit the EV load used in service and feeder calculations. The
   AHJ may require the system to be listed. UL 916 covers energy management equipment,
   and the chargers themselves are typically listed to UL 2594.
-* **SAE J1772.** The minimum pilot current is 6 A, so `min_charger_kw` is 1.44 kW (6 A at
-  240 V). An EV has 5 s to follow a lower pilot, which is why overdraw is only reported
-  after 10 s.
+* **SAE J1772.** The minimum pilot current is 6 A. The config refuses a `min_charger_kw`
+  below 6 A at the chargers' voltage. An EV has 5 s to follow a new pilot. That is why
+  overdraw is only reported after 10 s, and why the other-loads band (above) stays open
+  for 5 s plus one meter sample.
 * **Selling energy by the kWh.** Selling energy by the kWh needs type-approved EVSE metering
   (NIST Handbook 44, §3.40 "Electric Vehicle Fueling Systems"; enforced in California by
   the Division of Measurement Standards). The kWh this router records come from charger

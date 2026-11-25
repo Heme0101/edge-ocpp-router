@@ -285,7 +285,7 @@ def test_tx_default_profile_shape(cfg):
     profile = message[3]["csChargingProfiles"]
     assert message[3]["connectorId"] == 1
     assert profile["chargingProfilePurpose"] == "TxDefaultProfile"
-    assert profile["chargingProfileKind"] == "Relative" and profile["stackLevel"] == 0
+    assert profile["chargingProfileKind"] == "Relative" and profile["stackLevel"] == 1
     assert "transactionId" not in profile
     assert profile["chargingSchedule"] == {"chargingRateUnit": "W",
                                            "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 6666.0}]}
@@ -398,3 +398,48 @@ def test_tie_break_is_first_come_first_served(cfg):
     assert shares == {"late": 0.0, "early": 2.0}
     shares = gateway.allocate_power(weights, 2.0, cfg, arrival={"late": 1.0, "early": 5.0})
     assert shares == {"late": 2.0, "early": 0.0}
+
+
+def test_site_default_profile_never_collides_with_a_connector_default(cfg):
+    site = gateway.build_charging_profile(0, 0.0, cfg)[3]["csChargingProfiles"]
+    connector = gateway.build_charging_profile(1, 5.0, cfg)[3]["csChargingProfiles"]
+    assert site["chargingProfileId"] != connector["chargingProfileId"]
+    assert (site["stackLevel"], connector["stackLevel"]) == (0, 1)       # the connector's wins
+    assert site["chargingProfileId"] not in gateway.PROFILE_IDS.values()
+
+
+# ---------------------------------------------------------------- holding cuts within CT accuracy
+
+def test_small_cuts_held_within_site_tolerance():
+    committed = {"A": 5000, "B": 5000, "C": 5000}
+    send = {"A": 4900, "B": 4700, "C": 4500}                 # cuts of 100, 300, 500 W
+    result = gateway.hold_small_cuts(send, committed, dict(committed), 450)
+    assert result == {"A": 5000, "B": 5000, "C": 4500}       # 100 + 300 held, 500 would exceed
+
+
+def test_cut_that_stops_a_car_is_never_held_beyond_tolerance():
+    assert gateway.hold_small_cuts({"A": 0}, {"A": 1440}, {"A": 1440}, 800) == {"A": 0}
+
+
+def test_no_cut_held_without_known_accepted_limit_or_with_one_in_flight():
+    send, committed = {"A": 4900, "B": 4900}, {"A": 5000, "B": 5000}
+    accepted = {"A": None, "B": 3000}                        # unknown / a raise in flight
+    assert gateway.hold_small_cuts(send, committed, accepted, 10000) == send
+
+
+def test_increases_untouched_by_holding():
+    assert gateway.hold_small_cuts({"A": 6000}, {"A": 5000}, {"A": 5000}, 800) == {"A": 6000}
+
+
+def test_held_total_never_exceeds_tolerance_randomised():
+    rng = random.Random(11)
+    for _ in range(5000):
+        keys = [f"C{i}" for i in range(rng.randint(1, 12))]
+        committed = {k: rng.randint(0, 10000) for k in keys}
+        send = {k: rng.randint(0, 10000) for k in keys}
+        tolerance = rng.randint(0, 3000)
+        result = gateway.hold_small_cuts(send, committed, dict(committed), tolerance)
+        held = sum(result[k] - send[k] for k in keys)
+        assert 0 <= held <= tolerance
+        for k in keys:
+            assert result[k] in (send[k], committed[k])

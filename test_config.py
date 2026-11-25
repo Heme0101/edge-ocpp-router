@@ -22,16 +22,63 @@ def with_change(section, key, value):
 
 
 def test_shipped_config_values():
+    """The reference site: a small commercial / HOA building."""
     cfg = load_site_config()
-    assert (cfg.panel_limit_kw, cfg.safety_margin_kw) == (600.0, 120.0)
-    assert (cfg.max_charger_kw, cfg.min_charger_kw) == (10.0, 1.44)     # 6 A at 240 V (SAE J1772 minimum)
+    assert (cfg.service_voltage_v, cfg.service_phases, cfg.main_breaker_a) == (208.0, 3, 400.0)
+    assert (cfg.transformer_kva, cfg.min_power_factor) == (150.0, 0.9)
+    assert (cfg.panel_limit_kw, cfg.safety_margin_kw) == (100.0, 20.0)   # margin >= largest load step
+    assert (cfg.charger_voltage_v, cfg.charger_max_current_a) == (208.0, 32.0)
+    assert (cfg.max_charger_kw, cfg.min_charger_kw) == (6.656, 1.44)    # 32 A / 6.9 A at 208 V
     assert cfg.min_increase_w == 100.0 and cfg.meter_sample_interval_s == 5
-    assert cfg.peak_budget_cap_kw == 5.0
     assert (cfg.stale_floor_kw, cfg.telemetry_stale_after_s) == (2.0, 15.0)
+    assert cfg.ct_accuracy_pct == 1.0 and round(cfg.ct_tolerance_kw, 3) == 0.8    # 1 % of 80 kW
     assert cfg.peak_windows == (PeakWindow(16 * 60, 21 * 60),)       # PG&E 4-9 PM
+    assert cfg.peak_budget_cap_kw == 5.0
     assert cfg.timezone == "America/Los_Angeles"
     assert cfg.grid_signal_enabled is False
     assert (cfg.host, cfg.port) == ("localhost", 9000)
+
+
+def test_shipped_limit_fits_the_service_continuously():
+    # 208 V x 400 A x sqrt(3) x 80 % = 115.3 kVA (transformer 150 kVA is larger);
+    # x 0.9 power factor = 103.8 kW >= the 100 kW limit.
+    cfg = load_site_config()
+    assert round(cfg.continuous_capacity_kw, 1) == 103.8
+    assert cfg.panel_limit_kw <= cfg.continuous_capacity_kw
+
+
+def test_limit_above_continuous_rating_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="continuously"):
+        load_site_config(write(tmp_path, with_change("site", "panel_limit_kw", 110.0)))
+
+
+def test_100_percent_rated_breaker_allows_more(tmp_path):
+    data = with_change("site", "panel_limit_kw", 110.0)
+    data["electrical_service"]["breaker_100_percent_rated"] = True    # 144.1 kVA x 0.9 = 129.7 kW
+    assert load_site_config(write(tmp_path, data)).panel_limit_kw == 110.0
+
+
+def test_transformer_can_be_the_limit(tmp_path):
+    data = with_change("electrical_service", "transformer_kva", 75.0)   # 75 kVA x 0.9 = 67.5 kW
+    with pytest.raises(ConfigError, match="continuously"):
+        load_site_config(write(tmp_path, data))
+
+
+def test_single_phase_service(tmp_path):
+    data = copy.deepcopy(RAW)
+    data["electrical_service"].update(voltage_v=240.0, phases=1, main_breaker_a=200.0)   # 38.4 kVA
+    data["site"].update(panel_limit_kw=34.0, safety_margin_kw=4.0)
+    assert load_site_config(write(tmp_path, data)).continuous_capacity_kw == pytest.approx(34.56)
+
+
+def test_charger_max_above_its_rating_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="rating"):
+        load_site_config(write(tmp_path, with_change("chargers", "max_charger_kw", 7.2)))
+
+
+def test_charger_min_below_j1772_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="J1772"):
+        load_site_config(write(tmp_path, with_change("chargers", "min_charger_kw", 1.2)))   # < 1.248
 
 
 def test_relative_session_log_resolves_next_to_config(tmp_path):
@@ -77,12 +124,12 @@ def test_missing_section(tmp_path):
     ("site", "panel_limit_kw", "600"),
     ("site", "panel_limit_kw", True),
     ("site", "safety_margin_kw", -1),
-    ("site", "safety_margin_kw", 600.0),          # leaves nothing for the building
+    ("site", "safety_margin_kw", 100.0),          # leaves nothing for the building
     ("site", "timezone", "Mars/Olympus"),
     ("site", "site_meter_id", ""),
     ("site", "site_meter_id", "a/b"),
     ("chargers", "max_charger_kw", 0),
-    ("chargers", "min_charger_kw", 11.0),         # above the max
+    ("chargers", "min_charger_kw", 7.0),          # above the max
     ("chargers", "min_charger_kw", 0),
     ("chargers", "taper_threshold_w", 1440.0),    # would flag every car at the minimum
     ("chargers", "min_increase_w", 1440.0),       # a stopped car could never start
@@ -94,7 +141,14 @@ def test_missing_section(tmp_path):
     ("chargers", "taper_grace_s", -1),
     ("telemetry", "stale_after_s", 0),
     ("telemetry", "stale_floor_kw", 1.0),         # below min: the stale floor would be 0 W
-    ("telemetry", "stale_floor_kw", 481.0),       # above the usable capacity
+    ("telemetry", "stale_floor_kw", 91.0),        # above the usable capacity
+    ("electrical_service", "phases", 2),
+    ("telemetry", "ct_accuracy_pct", 6.0),
+    ("telemetry", "ct_accuracy_pct", -1.0),
+    ("electrical_service", "min_power_factor", 1.1),
+    ("electrical_service", "breaker_100_percent_rated", "no"),
+    ("electrical_service", "main_breaker_a", 0),
+    ("chargers", "max_current_a", 5.0),           # below the J1772 minimum
     ("tariff", "peak_budget_cap_kw", -1),
     ("tariff", "peak_windows", [{"start": "16:00", "end": "16:00"}]),
     ("tariff", "peak_windows", [{"start": "24:00", "end": "02:00"}]),

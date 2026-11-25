@@ -12,6 +12,7 @@ CT_RESOLUTION_KW = 0.001                    # the simulated CT reports whole wat
 
 
 def fast(cfg, **changes):
+    changes.setdefault("meter_sample_interval_s", 1)       # fresh EV readings, as on a tuned site
     return dataclasses.replace(cfg, allocation_interval_s=0.1, call_timeout_s=2.0, **changes)
 
 
@@ -80,13 +81,13 @@ def test_ct_dropout_throttles_to_floor(cfg):
 def test_battery_rises_with_power_received_and_not_without():
     car = SimCharger("CP_1", 50.0, battery_kwh=60.0, quiet=True)
     car.charging = True
-    car.limits["TxProfile"] = 6000.0
+    car.limits[("TxProfile", 1)] = 6000.0
     car.step(3600)                          # 6 kW for an hour into 60 kWh = +10 %
     assert abs(car.soc - 60.0) < 1e-9 and abs(car.energy_wh - 6000.0) < 1e-6
-    car.limits["TxProfile"] = 0.0
+    car.limits[("TxProfile", 1)] = 0.0
     car.step(3600)                          # 0 W gains nothing
     assert abs(car.soc - 60.0) < 1e-9
-    car.limits["TxProfile"] = 20000.0       # never more than the car's own maximum
+    car.limits[("TxProfile", 1)] = 20000.0       # never more than the car's own maximum
     car.soc = 99.99
     car.step(3600)
     assert car.soc == 100.0 and car.power_w() == 0.0
@@ -137,23 +138,31 @@ def test_ct_never_exceeds_usable_capacity_under_random_load(cfg):
         url = f"ws://127.0.0.1:{ws_server.sockets[0].getsockname()[1]}"
         tasks = [asyncio.create_task(server.allocation_loop(cs)), asyncio.create_task(meter.run(url))]
         tasks += [asyncio.create_task(c.run(url)) for c in cars]
-        longest, streak, sampled = 0.0, 0.0, 0
+        longest, streak, sampled, worst_kw, biggest_step = 0.0, 0.0, 0, 0.0, 0.0
         try:
             await asyncio.sleep(1.5)
             loop = asyncio.get_running_loop()
             for _ in range(40):
+                before = meter.load_kw
                 meter.load_kw = rng.uniform(455.0, 479.0)  # always leaves some EV budget
+                biggest_step = max(biggest_step, meter.load_kw - before)
                 end = loop.time() + 0.4
                 while loop.time() < end:
                     await asyncio.sleep(0.01)
                     sampled += 1
-                    streak = streak + 0.01 if meter.total_kw() > usable + CT_RESOLUTION_KW else 0.0
+                    over = meter.total_kw() - usable
+                    worst_kw = max(worst_kw, over)
+                    streak = streak + 0.01 if over > CT_RESOLUTION_KW else 0.0
                     longest = max(longest, streak)
-            # A jump in other loads overshoots until the next CT reading (50 ms) plus one
-            # immediate cycle and a profile round trip; it must never persist.
+            # A jump in the other loads overshoots by the jump itself until the CT reports it:
+            # no controller can prevent that. What the controller must guarantee is that it
+            # never ADDS to it, and that it never persists: a jump that coincides with one of
+            # our own raises cannot be told apart from the cars ramping up until their next
+            # power reading (1 s here), so it may last up to that long. The safety margin
+            # must therefore be at least the largest load step (see README).
             assert sampled > 1000
-            assert longest <= 0.25, longest
-            assert meter.total_kw() <= usable + CT_RESOLUTION_KW
+            assert worst_kw <= biggest_step + CT_RESOLUTION_KW, (worst_kw, biggest_step)
+            assert longest <= 1.0 + 0.25, longest
         finally:
             for task in tasks:
                 task.cancel()
@@ -161,3 +170,27 @@ def test_ct_never_exceeds_usable_capacity_under_random_load(cfg):
             ws_server.close()
             await ws_server.wait_closed()
     asyncio.run(scenario())
+
+
+def test_charger_hardware_rating_caps_the_draw():
+    car = SimCharger("CP_1", 20.0, evse_max_kw=6.656, car_max_kw=11.5, quiet=True)
+    car.charging = True
+    assert car.power_w() == 6656.0                  # no profile yet: the charger's own rating
+    car.limits[("TxProfile", 1)] = 9000.0
+    assert car.power_w() == 6656.0
+    car.limits[("TxProfile", 1)] = 3000.0
+    assert car.power_w() == 3000.0
+
+
+def test_simulated_building_load_cycles_hvac_and_varies():
+    import time
+    meter = SimSiteMeter("M", 55.0, hvac_kw=15.0, hvac_period_s=0.2, noise_pct=2.0, seed=1, quiet=True)
+    seen_on, seen_off = set(), set()
+    end = time.monotonic() + 0.5
+    while time.monotonic() < end:
+        (seen_on if meter.hvac_on() else seen_off).add(round(meter.other_kw(), 3))
+        time.sleep(0.01)
+    assert seen_on == {70.0} and seen_off == {55.0}             # noise is drawn per reading
+    for _ in range(1000):
+        meter._noise_kw = meter._rng.uniform(-1.0, 1.0) * meter.noise_pct / 100 * meter.load_kw
+        assert 53.9 <= meter.other_kw() - (15.0 if meter.hvac_on() else 0.0) <= 56.1

@@ -19,6 +19,10 @@ CHARGE_POINT_MAX_PROFILE = "ChargePointMaxProfile"
 # One id per purpose. OCPP 1.6 replaces an installed profile that has the same
 # chargingProfileId, so sharing one id would let a ChargePointMaxProfile wipe a TxProfile.
 PROFILE_IDS = {TX_DEFAULT_PROFILE: 1, TX_PROFILE: 2, CHARGE_POINT_MAX_PROFILE: 3}
+# The site-wide default (TxDefaultProfile on connector 0) has its own id, and per-connector
+# TxDefaultProfiles sit one stack level higher, so neither ever replaces the other and the
+# connector-specific one takes precedence.
+SITE_DEFAULT_PROFILE_ID = 4
 
 
 def available_ev_budget_kw(building_load_kw, cfg: SiteConfig):
@@ -160,17 +164,51 @@ def allocate_power(weights, budget_kw, cfg: SiteConfig, caps=None, arrival=None)
     return power_reserved_kw
 
 
-def estimate_other_load_kw(site_total_kw, ev_draws_kw):
+def estimate_other_load_kw(site_total_kw, ev_draws_kw, ev_draws_high_kw=None, previous_kw=None):
     """Everything on the site that is not an EV, from the main-feeder CT reading.
 
-    The CT measures the whole building INCLUDING the chargers, so the chargers' own
-    metered draw is subtracted. The caller passes, per car, the smaller of its fresh
-    metered power and the limit it accepted: that can only under-count EV power, which
-    over-counts the other loads and so errs toward a smaller EV budget, never a larger one.
+    The CT measures the whole site INCLUDING the chargers, so the chargers' draw is
+    subtracted. Each car's draw at the CT instant is only known within bounds: low
+    (ev_draws_kw) and high (ev_draws_high_kw). They differ when a car's limit changed
+    after its last power reading, since it may or may not have followed yet. So the
+    other loads are known to lie in the band
+
+        [site_total - sum(high), site_total - sum(low)].
+
+    Without a previous estimate, the top of the band is used: the most the other loads
+    can be, which is the safe side. With one, the previous estimate is kept but clamped
+    into the band, so it moves only when the CT reading proves the other loads moved.
+    A CT rise fully explained by our own raise changes nothing. When every reading is
+    current, the band is a single value and the estimate is exact, with no lag.
     A negative result (meters briefly disagreeing) is treated as 0. The result is rounded
     UP to a whole watt: a bigger other load means a smaller EV budget, the safe direction.
     """
-    return max(0, watts_ceil(site_total_kw - sum(ev_draws_kw))) / 1000
+    upper = site_total_kw - sum(ev_draws_kw)
+    lower = upper if ev_draws_high_kw is None else site_total_kw - sum(ev_draws_high_kw)
+    estimate = upper if previous_kw is None else min(max(previous_kw, lower), upper)
+    return max(0, watts_ceil(estimate)) / 1000
+
+
+def hold_small_cuts(send_w, committed_w, accepted_w, tolerance_w):
+    """Skip cuts too small to matter, bounded across the whole site.
+
+    A cut smaller than the CT meter's own accuracy only chases measurement noise and
+    costs a message per charger per reading. Cuts are held (the car keeps its accepted
+    limit) smallest first, as long as the TOTAL held back across all chargers stays
+    within tolerance_w (the meter's accuracy). Anything beyond that, including any cut
+    that stops a car, goes out at once. Only a car whose accepted limit is known and
+    has nothing newer in flight can be held. Integer watts.
+    """
+    result = dict(send_w)
+    cuts = sorted((committed_w[key] - watts, str(key), key) for key, watts in send_w.items()
+                  if watts < committed_w[key] and accepted_w.get(key) == committed_w[key])
+    held = 0
+    for size, _, key in cuts:
+        if held + size > tolerance_w:
+            break
+        result[key] = committed_w[key]
+        held += size
+    return result
 
 
 def transition_safe_limits(targets_w, committed_w, budget_w, reserved_w, priority, min_w):
@@ -260,7 +298,8 @@ def build_charging_profile(connector_id: int, allocated_kw: float, cfg: SiteConf
 
     TxProfile needs the running transaction's id. ChargePointMaxProfile limits the whole
     charger, so it goes to connector 0 and, having no transaction to be relative to, is
-    Absolute from start_schedule.
+    Absolute from start_schedule. A TxDefaultProfile on connector 0 is the site default
+    every new session starts under (see SITE_DEFAULT_PROFILE_ID).
     """
     if purpose not in PROFILE_IDS:
         raise ValueError(f"unknown charging profile purpose {purpose!r}")
@@ -286,9 +325,10 @@ def build_charging_profile(connector_id: int, allocated_kw: float, cfg: SiteConf
         "chargingRateUnit": "W",
         "chargingSchedulePeriod": [{"startPeriod": 0, "limit": watts}],
     }
+    site_default = purpose == TX_DEFAULT_PROFILE and connector_id == 0
     profile = {
-        "chargingProfileId": PROFILE_IDS[purpose],
-        "stackLevel": 0,
+        "chargingProfileId": SITE_DEFAULT_PROFILE_ID if site_default else PROFILE_IDS[purpose],
+        "stackLevel": 1 if purpose == TX_DEFAULT_PROFILE and not site_default else 0,
         "chargingProfilePurpose": purpose,
         "chargingProfileKind": "Relative",
         "chargingSchedule": schedule,

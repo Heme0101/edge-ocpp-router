@@ -33,14 +33,21 @@ class FakeCharger:
     """Stands in for a websocket. Records every frame the server sends and answers it via
     `script(message) -> reply payload | ("error", code) | None (no reply)`."""
 
-    def __init__(self, cs, charger_id, script=lambda message: ACCEPT):
+    def __init__(self, cs, charger_id, script=lambda message: ACCEPT, default_reply=ACCEPT):
+        """The 0 W site default profile is answered with default_reply (None: no answer)
+        and kept apart in .defaults, so .sent holds only the per-car traffic."""
         self.cs, self.charger_id, self.script, self.sent = cs, charger_id, script, []
+        self.default_reply, self.defaults = default_reply, []
         cs.attach(charger_id, self.send)
 
     async def send(self, text):
         message = json.loads(text)
-        self.sent.append(message)
-        reply = self.script(message)
+        if is_site_default(message):
+            self.defaults.append(message)
+            reply = self.default_reply
+        else:
+            self.sent.append(message)
+            reply = self.script(message)
         if reply is None:
             return
         if isinstance(reply, tuple):
@@ -55,6 +62,11 @@ class FakeCharger:
     def limits(self):
         return [(p["csChargingProfiles"]["chargingProfilePurpose"], p["connectorId"],
                  gateway.profile_limit_w(["", "", "", p])) for p in self.profiles()]
+
+
+def is_site_default(message):
+    return (message[2] == "SetChargingProfile" and message[3]["connectorId"] == 0
+            and message[3]["csChargingProfiles"]["chargingProfilePurpose"] == "TxDefaultProfile")
 
 
 def make(cfg, clock=None, **kwargs):
@@ -94,6 +106,19 @@ def plug(cs, charger_id, soc=None, transaction=True, connector=1, meter_start=0)
 def power(cs, charger_id, watts, connector=1):
     result(cs, charger_id, "MeterValues", {"connectorId": connector, "meterValue": [{
         "timestamp": "t", "sampledValue": [{"value": str(watts), "measurand": "Power.Active.Import", "unit": "W"}]}]})
+
+
+def measure(cs, other_kw):
+    """A real site: every car reports drawing the limit it accepted, then the main-feeder
+    CT reads the other loads plus all of that EV draw."""
+    ev_w = 0
+    for charger in cs.chargers.values():
+        for connector_id, connector in charger.connectors.items():
+            s = connector.session
+            if s is not None and s.accepted_w is not None and not s.charging_stopped:
+                power(cs, charger.charger_id, s.accepted_w, connector=connector_id)
+                ev_w += s.accepted_w
+    site_load(cs, other_kw + ev_w / 1000)
 
 
 async def cycle(cs):
@@ -295,10 +320,10 @@ def test_no_resend_until_change_or_refresh(cfg):
         await cycle(cs)                                    # unchanged: nothing sent
         assert len(cp.profiles()) == 1
         clock.advance(cfg.profile_refresh_s)
-        site_load(cs, 470.0)
+        measure(cs, 470.0)
         await cycle(cs)                                    # refresh interval reached
         assert len(cp.profiles()) == 2
-        site_load(cs, 474.0)                               # budget 6 kW: limit changes
+        measure(cs, 474.0)                                 # budget 6 kW: limit changes
         await cycle(cs)
         assert cp.limits()[-1] == ("TxProfile", 1, 6000.0)
     run(scenario())
@@ -464,7 +489,7 @@ def test_rejected_tx_profile_falls_back_to_charge_point_max(cfg, caplog):
         assert profile["stackLevel"] == 0 and profile["chargingProfileKind"] == "Absolute"
         assert cs.chargers["CP_1"].use_max_profile and session(cs, "CP_1").used_fallback
         assert not any(m[2] == "RemoteStopTransaction" for m in cp.sent)
-        site_load(cs, 474.0)                               # change: only ChargePointMax is used now
+        measure(cs, 474.0)                                 # change: only ChargePointMax is used now
         await cycle(cs)
         assert cp.limits()[-1] == ("ChargePointMaxProfile", 0, 4000.0)
     run(scenario())
@@ -548,7 +573,7 @@ def test_charge_point_max_rejected_later_escalates_and_stops_using_it(cfg, caplo
         await cycle(cs)
         assert cs.chargers["CP_1"].use_max_profile
         state["max_ok"] = False
-        site_load(cs, 474.0)
+        measure(cs, 474.0)
         await cycle(cs)
         assert not cs.chargers["CP_1"].use_max_profile and session(cs, "CP_1").uncontrollable
     run(scenario())
@@ -799,20 +824,20 @@ def test_small_increase_skipped_small_decrease_sent_refresh_catches_up(cfg):
         site_load(cs, 475.0)                               # budget 5000
         await cycle(cs)
         assert cp.limits()[-1][2] == 5000.0
-        site_load(cs, 474.95)                              # budget 5050: +50 W, below 100 W
+        measure(cs, 474.95)                                # budget 5050: +50 W, below 100 W
         await cycle(cs)
         assert len(cp.profiles()) == 1
-        site_load(cs, 475.001)                             # budget 4999: -1 W goes out at once
+        measure(cs, 475.001)                               # budget 4999: -1 W goes out at once
         await cycle(cs)
         assert cp.limits()[-1][2] == 4999.0
-        site_load(cs, 474.9)                               # budget 5100: +101 W goes out
+        measure(cs, 474.9)                                 # budget 5100: +101 W goes out
         await cycle(cs)
         assert cp.limits()[-1][2] == 5100.0
-        site_load(cs, 474.85)                              # +50 W: held...
+        measure(cs, 474.85)                                # +50 W: held...
         await cycle(cs)
         assert cp.limits()[-1][2] == 5100.0
         clock.advance(cfg.profile_refresh_s)
-        site_load(cs, 474.85)
+        measure(cs, 474.85)
         await cycle(cs)                                    # ...until the 30 s refresh
         assert cp.limits()[-1][2] == 5150.0
     run(scenario())
@@ -1072,16 +1097,243 @@ def test_car_that_started_after_the_ct_reading_is_not_subtracted(cfg):
     assert cs.plan().other_load_kw == 470.0
 
 
-def test_car_that_stopped_on_its_own_after_the_ct_reading_counts_the_lower_value(cfg):
+def test_car_that_stopped_on_its_own_after_the_ct_reading(cfg):
+    """The CT (479) was read while the car drew 9 kW or after it dropped to 1 kW: the
+    other loads are 470 or up to 478. Fresh, the estimator takes the safe top (478); with
+    a previous estimate of 470 that fits, it keeps 470; and the next CT reading settles it."""
+    assert gateway.estimate_other_load_kw(479.0, [1.0], [9.0]) == 478.0
+    assert gateway.estimate_other_load_kw(479.0, [1.0], [9.0], previous_kw=470.0) == 470.0
     cs, clock = make(cfg)
     FakeCharger(cs, "CP_1")
     plug(cs, "CP_1", soc=22.0)
     site_load(cs, 470.0)
-    run(cycle(cs))                                         # 10000 accepted
+    run(cycle(cs))                                         # 10000 accepted; estimate 470
     clock.advance(0.5)
     power(cs, "CP_1", 9000)
     clock.advance(0.1)
-    site_load(cs, 479.0)                                   # CT: 470 + 9
+    site_load(cs, 479.0)
     clock.advance(0.1)
     power(cs, "CP_1", 1000)                                # tapered by itself, no cut from us
-    assert cs.plan().other_load_kw == pytest.approx(478.0)  # 479 - 1: the safe side
+    assert cs.plan().other_load_kw == pytest.approx(470.0)
+    clock.advance(0.5)
+    site_load(cs, 471.0)                                   # the next CT reading: 470 + 1
+    assert cs.plan().other_load_kw == pytest.approx(470.0)
+
+
+def test_estimate_never_hides_a_load_increase_from_a_silent_charger(cfg):
+    """A charger that never reports power: once its last limit change is older than the
+    J1772 response time + one meter sample, its draw counts as other load. A real
+    increase in the other loads is then seen in full, never absorbed into the band."""
+    cs, clock = make(cfg)
+    FakeCharger(cs, "CP_1")
+    plug(cs, "CP_1", soc=22.0)
+    site_load(cs, 470.0)
+    run(cycle(cs))                                         # 10 kW accepted, never reported
+    clock.advance(5.0 + cfg.meter_sample_interval_s + 0.1)
+    site_load(cs, 476.0)
+    assert cs.plan().other_load_kw == 476.0
+
+
+def test_estimate_follows_a_load_increase_beyond_our_own_raise(cfg):
+    """Right after a raise the band is wide, but a CT rise bigger than the raise can
+    explain moves the estimate at once (by at least the unexplained part)."""
+    cs, _ = make(cfg)
+    FakeCharger(cs, "CP_1")
+    plug(cs, "CP_1", soc=22.0)
+    power(cs, "CP_1", 0)
+    site_load(cs, 470.0)
+    run(cycle(cs))                                         # raised 0 -> 10 kW; estimate 470
+    site_load(cs, 495.0)                                   # 10 kW is ours at most: 15 kW is not
+    assert cs.plan().other_load_kw >= 485.0
+
+
+# ---------------------------------------------------------------- CT telemetry messages
+
+def telemetry_messages(caplog):
+    return [(r.levelname, r.getMessage().split(";")[0]) for r in caplog.records
+            if "CT" in r.getMessage()]
+
+
+def test_startup_waits_quietly_for_the_first_ct_reading(cfg, caplog):
+    caplog.set_level(logging.INFO, logger="edge_ocpp_router")
+    cs, clock = make(cfg)
+    cs.plan()                                              # server just started, no meter yet
+    clock.advance(5)
+    cs.plan()
+    site_load(cs, 470.0)
+    cs.plan()
+    assert telemetry_messages(caplog) == [
+        ("INFO", "waiting for the first CT reading from SITE_METER"),
+        ("INFO", "first CT reading received (470.0 kW)")]
+
+
+def test_meter_that_never_connects_is_a_warning(cfg, caplog):
+    cs, clock = make(cfg)
+    cs.plan()
+    clock.advance(cfg.telemetry_stale_after_s + 1)
+    cs.plan()
+    assert ("WARNING", "no CT reading from SITE_METER in the 16 s since startup (is the site "
+                       "meter connected?)") in telemetry_messages(caplog)
+
+
+def test_readings_that_stop_are_a_stale_warning_then_restored(cfg, caplog):
+    caplog.set_level(logging.INFO, logger="edge_ocpp_router")
+    cs, clock = make(cfg)
+    site_load(cs, 470.0)
+    cs.plan()
+    clock.advance(16)
+    cs.plan()
+    cs.plan()                                              # logged once, not every cycle
+    site_load(cs, 470.0)
+    cs.plan()
+    assert telemetry_messages(caplog)[-2:] == [
+        ("WARNING", "CT telemetry is stale: the last reading from SITE_METER is 16 s old (limit 15 s)"),
+        ("INFO", "CT telemetry restored (470.0 kW)")]
+
+
+
+# ---------------------------------------------------------------- 0 W site default for new sessions
+
+def test_site_default_installed_first_on_connect(cfg):
+    cs, _ = make(cfg)
+    cp = FakeCharger(cs, "CP_1")
+    run(cycle(cs))
+    assert len(cp.defaults) == 1
+    profile = cp.defaults[0][3]["csChargingProfiles"]
+    assert cp.defaults[0][3]["connectorId"] == 0
+    assert (profile["chargingProfileId"], profile["stackLevel"]) == (gateway.SITE_DEFAULT_PROFILE_ID, 0)
+    assert gateway.profile_limit_w(cp.defaults[0]) == 0.0
+    assert cs.chargers["CP_1"].default_accepted_at is not None
+    run(cycle(cs))
+    assert len(cp.defaults) == 1                           # once, not every cycle
+
+
+def test_site_default_reinstalled_after_boot_and_reconnect(cfg):
+    cs, _ = make(cfg)
+    cp = FakeCharger(cs, "CP_1")
+    run(cycle(cs))
+    result(cs, "CP_1", "BootNotification", {"chargePointVendor": "V", "chargePointModel": "M"})
+    assert cs.chargers["CP_1"].default_accepted_at is None  # may have been lost in the reboot
+    run(cycle(cs))
+    assert len(cp.defaults) == 2
+    again = FakeCharger(cs, "CP_1")
+    run(cycle(cs))
+    assert len(again.defaults) == 1
+
+
+def test_car_arriving_under_the_default_does_not_block_others(cfg):
+    """With the default in place, a new car is known to start at 0 W, so the others are not
+    held back while its first limit is on its way (compare the test without a default)."""
+    cs, _ = make(cfg)
+    a = FakeCharger(cs, "CP_A")
+    b = FakeCharger(cs, "CP_B")
+    plug(cs, "CP_A", soc=22.0)
+    site_load(cs, 476.0)                                   # budget 4000
+
+    async def scenario():
+        await cycle(cs)                                    # defaults installed, A at 4000
+        site_load(cs, 470.0)                               # budget 10000
+        plug(cs, "CP_B", soc=22.0)                         # B arrives under the 0 W default
+        assert session(cs, "CP_B").under_default
+        await cycle(cs)
+        assert a.limits()[-1][2] == 5000.0 and b.limits()[-1][2] == 5000.0
+    run(scenario())
+
+
+def test_rejected_site_default_counts_new_cars_at_max(cfg, caplog):
+    cs, _ = make(cfg)
+    FakeCharger(cs, "CP_1", default_reply=REJECT)
+    run(cycle(cs))
+    assert "answered Rejected to the 0 W site default profile" in caplog.text
+    plug(cs, "CP_1", soc=22.0)
+    assert not session(cs, "CP_1").under_default
+    assert cs._committed_w(session(cs, "CP_1")) == 10000
+
+
+def test_unanswered_site_default_is_retried_and_blocks_nothing_else(cfg):
+    cfg = dataclasses.replace(cfg, call_timeout_s=0.05)
+    cs, _ = make(cfg)
+    cp = FakeCharger(cs, "CP_1", default_reply=None)
+
+    async def scenario():
+        await cycle(cs)
+        assert cs.chargers["CP_1"].needs_default_profile
+        cp.default_reply = ACCEPT
+        await cycle(cs)
+        assert not cs.chargers["CP_1"].needs_default_profile
+    run(scenario())
+
+
+def test_adopted_transaction_is_not_assumed_at_zero(cfg):
+    cs, _ = make(cfg)
+    FakeCharger(cs, "CP_1")
+    run(cycle(cs))                                         # default accepted
+    result(cs, "CP_1", "MeterValues", {"connectorId": 1, "transactionId": 555, "meterValue": [{
+        "timestamp": "t", "sampledValue": [{"value": "6000", "measurand": "Power.Active.Import"}]}]})
+    assert not session(cs, "CP_1").under_default          # started before we knew of it
+    assert cs._committed_w(session(cs, "CP_1")) == 10000
+
+
+def test_plug_in_wakes_the_allocation_loop(cfg):
+    cs, _ = make(cfg)
+
+    async def scenario():
+        FakeCharger(cs, "CP_1")
+        waiter = asyncio.create_task(cs.wait_for_next_cycle())
+        await asyncio.sleep(0)
+        plug(cs, "CP_1", soc=22.0)
+        await asyncio.wait_for(waiter, 0.5)                # well before the 2 s interval
+    run(scenario())
+
+
+def test_noisy_ct_does_not_chatter_but_real_drops_cut_at_once(cfg):
+    """A 1 % CT on 480 kW usable cannot resolve 4.8 kW. Readings wobbling within that send
+    nothing; a drop bigger than it goes out on the same cycle."""
+    cfg = dataclasses.replace(cfg, ct_accuracy_pct=1.0)
+    cs, _ = make(cfg)
+    cp1, cp2 = FakeCharger(cs, "CP_1"), FakeCharger(cs, "CP_2")
+    plug(cs, "CP_1", soc=22.0)
+    plug(cs, "CP_2", soc=22.0)
+
+    async def scenario():
+        measure(cs, 460.0)                                 # budget 20 kW: 10 kW each
+        await cycle(cs)
+        sent = len(cp1.profiles()) + len(cp2.profiles())
+        for other in (460.4, 461.1, 460.2, 462.3, 461.7, 460.9):   # noise, under 4.8 kW
+            measure(cs, other)
+            await cycle(cs)
+        assert len(cp1.profiles()) + len(cp2.profiles()) == sent
+        measure(cs, 470.0)                                 # a real 10 kW drop in budget
+        await cycle(cs)
+        assert cp1.limits()[-1][2] + cp2.limits()[-1][2] == 10000.0
+    run(scenario())
+
+
+def test_held_cuts_keep_the_worst_case_within_budget_plus_tolerance(cfg):
+    cfg = dataclasses.replace(cfg, ct_accuracy_pct=1.0)
+    cs, _ = make(cfg)
+    for cid in ("CP_1", "CP_2", "CP_3"):
+        FakeCharger(cs, cid)
+        plug(cs, cid, soc=22.0)
+
+    async def scenario():
+        measure(cs, 450.0)
+        await cycle(cs)
+        for other in (451.5, 453.0, 452.0, 454.5):
+            measure(cs, other)
+            plan = cs.plan()
+            budget_w = gateway.watts_floor(plan.decision.budget_kw)
+            assert sum(plan.send_w.values()) <= budget_w + gateway.watts_floor(cfg.ct_tolerance_kw)
+            await cycle(cs)
+    run(scenario())
+
+
+def test_meter_that_connects_late_logs_first_reading_not_restored(cfg, caplog):
+    caplog.set_level(logging.INFO, logger="edge_ocpp_router")
+    cs, clock = make(cfg)
+    cs.plan()
+    clock.advance(cfg.telemetry_stale_after_s + 1)
+    cs.plan()
+    site_load(cs, 470.0)
+    cs.plan()
+    assert telemetry_messages(caplog)[-1] == ("INFO", "first CT reading received (470.0 kW)")

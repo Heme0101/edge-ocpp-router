@@ -17,15 +17,19 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("site_config.json")
 
 _SCHEMA = {
     "site": {"panel_limit_kw", "safety_margin_kw", "site_meter_id", "timezone"},
-    "chargers": {"max_charger_kw", "min_charger_kw", "min_increase_w", "taper_threshold_w",
-                 "taper_grace_s", "offline_session_timeout_s"},
-    "telemetry": {"stale_after_s", "stale_floor_kw"},
+    "electrical_service": {"voltage_v", "phases", "main_breaker_a", "breaker_100_percent_rated",
+                           "transformer_kva", "min_power_factor"},
+    "chargers": {"voltage_v", "max_current_a", "max_charger_kw", "min_charger_kw", "min_increase_w",
+                 "taper_threshold_w", "taper_grace_s", "offline_session_timeout_s"},
+    "telemetry": {"stale_after_s", "stale_floor_kw", "ct_accuracy_pct"},
     "tariff": {"peak_windows", "peak_budget_cap_kw"},
     "grid_signal": {"enabled", "poll_interval_s", "max_age_s"},
     "server": {"host", "port", "allocation_interval_s", "profile_refresh_s", "call_timeout_s",
                "meter_sample_interval_s", "session_log_path"},
 }
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+J1772_MIN_CURRENT_A = 6.0       # SAE J1772: the lowest pilot current a charger may offer
+STANDARD_BREAKER_CONTINUOUS = 0.8   # NEC: a standard breaker carries 80 % continuously
 
 
 class ConfigError(ValueError):
@@ -53,6 +57,14 @@ class SiteConfig:
     safety_margin_kw: float
     site_meter_id: str
     timezone: str
+    service_voltage_v: float
+    service_phases: int
+    main_breaker_a: float
+    breaker_100_percent_rated: bool
+    transformer_kva: float
+    min_power_factor: float
+    charger_voltage_v: float
+    charger_max_current_a: float
     max_charger_kw: float
     min_charger_kw: float
     min_increase_w: float
@@ -61,6 +73,7 @@ class SiteConfig:
     offline_session_timeout_s: float
     telemetry_stale_after_s: float
     stale_floor_kw: float
+    ct_accuracy_pct: float
     peak_windows: tuple[PeakWindow, ...]
     peak_budget_cap_kw: float
     grid_signal_enabled: bool
@@ -89,6 +102,7 @@ class SiteConfig:
             ZoneInfo(self.timezone)
         except (ZoneInfoNotFoundError, ValueError, TypeError):
             raise ConfigError(f"site.timezone {self.timezone!r} is not a known IANA time zone")
+        self._check_electrical()
         _check("chargers.max_charger_kw", self.max_charger_kw, low=0.0, low_inclusive=False)
         _check("chargers.min_charger_kw", self.min_charger_kw, low=0.0, low_inclusive=False,
                high=self.max_charger_kw)
@@ -107,6 +121,11 @@ class SiteConfig:
         # case the floor exists to avoid.
         _check("telemetry.stale_floor_kw", self.stale_floor_kw, low=self.min_charger_kw,
                high=usable_kw)
+        # A meter accuracy class: 0.2, 0.5, 1 or 2 % are usual for CT meters.
+        _check("telemetry.ct_accuracy_pct", self.ct_accuracy_pct, low=0.0, high=5.0)
+        if self.ct_tolerance_kw > self.safety_margin_kw:
+            raise ConfigError("site.safety_margin_kw must at least cover the CT meter's accuracy "
+                              f"({self.ct_tolerance_kw:g} kW)")
         if not isinstance(self.peak_windows, tuple) or not all(
                 isinstance(w, PeakWindow) for w in self.peak_windows):
             raise ConfigError("tariff.peak_windows must be a list of windows")
@@ -130,6 +149,53 @@ class SiteConfig:
                               "at least 1 and below telemetry.stale_after_s")
         if self.session_log_path is not None:
             _check_text("server.session_log_path", self.session_log_path)
+
+    def _check_electrical(self):
+        """The kW settings must be physically possible for the installed equipment."""
+        _check("electrical_service.voltage_v", self.service_voltage_v, low=0.0, low_inclusive=False)
+        if self.service_phases not in (1, 3) or isinstance(self.service_phases, bool):
+            raise ConfigError("electrical_service.phases must be 1 or 3")
+        _check("electrical_service.main_breaker_a", self.main_breaker_a, low=0.0, low_inclusive=False)
+        if not isinstance(self.breaker_100_percent_rated, bool):
+            raise ConfigError("electrical_service.breaker_100_percent_rated must be true or false")
+        _check("electrical_service.transformer_kva", self.transformer_kva, low=0.0, low_inclusive=False)
+        _check("electrical_service.min_power_factor", self.min_power_factor, low=0.0,
+               low_inclusive=False, high=1.0)
+        capacity_kw = self.continuous_capacity_kw
+        if self.panel_limit_kw > capacity_kw + 1e-9:
+            raise ConfigError(
+                f"site.panel_limit_kw {self.panel_limit_kw} is above what the service can carry "
+                f"continuously: {capacity_kw:.1f} kW (the lower of the transformer and "
+                f"{'100' if self.breaker_100_percent_rated else '80'} % of the main breaker, at "
+                f"power factor {self.min_power_factor}). EV charging is a continuous load.")
+
+        _check("chargers.voltage_v", self.charger_voltage_v, low=0.0, low_inclusive=False)
+        _check("chargers.max_current_a", self.charger_max_current_a, low=J1772_MIN_CURRENT_A)
+        rated_kw = round(self.charger_voltage_v * self.charger_max_current_a, 6) / 1000
+        if self.max_charger_kw > rated_kw:
+            raise ConfigError(f"chargers.max_charger_kw {self.max_charger_kw} is above the chargers' "
+                              f"rating: {self.charger_max_current_a:g} A x {self.charger_voltage_v:g} V "
+                              f"= {rated_kw:g} kW")
+        j1772_min_kw = round(self.charger_voltage_v * J1772_MIN_CURRENT_A, 6) / 1000
+        if self.min_charger_kw < j1772_min_kw:
+            raise ConfigError(f"chargers.min_charger_kw {self.min_charger_kw} is below the SAE J1772 "
+                              f"minimum of 6 A x {self.charger_voltage_v:g} V = {j1772_min_kw:g} kW")
+
+    @property
+    def ct_tolerance_kw(self) -> float:
+        """What the CT meter cannot resolve: its accuracy over the usable capacity."""
+        return self.ct_accuracy_pct / 100 * (self.panel_limit_kw - self.safety_margin_kw)
+
+    @property
+    def continuous_capacity_kw(self) -> float:
+        """The most the service can carry continuously, in kW: the lower of the utility
+        transformer and the main breaker's continuous rating (80 % unless 100 %-rated),
+        times the worst expected power factor (breakers and transformers are limited by
+        current, i.e. kVA, while the CT meter reports real power, kW)."""
+        phase_factor = math.sqrt(3) if self.service_phases == 3 else 1.0
+        breaker_share = 1.0 if self.breaker_100_percent_rated else STANDARD_BREAKER_CONTINUOUS
+        breaker_kva = self.service_voltage_v * self.main_breaker_a * phase_factor * breaker_share / 1000
+        return min(self.transformer_kva, breaker_kva) * self.min_power_factor
 
     @property
     def tz(self) -> ZoneInfo:
@@ -156,6 +222,7 @@ def load_site_config(path: str | Path = DEFAULT_CONFIG_PATH) -> SiteConfig:
         _exact_keys(section, data[section], keys)
 
     site, chargers, telemetry = data["site"], data["chargers"], data["telemetry"]
+    service = data["electrical_service"]
     tariff, grid, server = data["tariff"], data["grid_signal"], data["server"]
 
     log_path = server["session_log_path"]
@@ -167,6 +234,14 @@ def load_site_config(path: str | Path = DEFAULT_CONFIG_PATH) -> SiteConfig:
         safety_margin_kw=_num("site.safety_margin_kw", site["safety_margin_kw"]),
         site_meter_id=site["site_meter_id"],
         timezone=site["timezone"],
+        service_voltage_v=_num("electrical_service.voltage_v", service["voltage_v"]),
+        service_phases=service["phases"],
+        main_breaker_a=_num("electrical_service.main_breaker_a", service["main_breaker_a"]),
+        breaker_100_percent_rated=service["breaker_100_percent_rated"],
+        transformer_kva=_num("electrical_service.transformer_kva", service["transformer_kva"]),
+        min_power_factor=_num("electrical_service.min_power_factor", service["min_power_factor"]),
+        charger_voltage_v=_num("chargers.voltage_v", chargers["voltage_v"]),
+        charger_max_current_a=_num("chargers.max_current_a", chargers["max_current_a"]),
         max_charger_kw=_num("chargers.max_charger_kw", chargers["max_charger_kw"]),
         min_charger_kw=_num("chargers.min_charger_kw", chargers["min_charger_kw"]),
         min_increase_w=_num("chargers.min_increase_w", chargers["min_increase_w"]),
@@ -176,6 +251,7 @@ def load_site_config(path: str | Path = DEFAULT_CONFIG_PATH) -> SiteConfig:
                                        chargers["offline_session_timeout_s"]),
         telemetry_stale_after_s=_num("telemetry.stale_after_s", telemetry["stale_after_s"]),
         stale_floor_kw=_num("telemetry.stale_floor_kw", telemetry["stale_floor_kw"]),
+        ct_accuracy_pct=_num("telemetry.ct_accuracy_pct", telemetry["ct_accuracy_pct"]),
         peak_windows=_parse_windows(tariff["peak_windows"]),
         peak_budget_cap_kw=_num("tariff.peak_budget_cap_kw", tariff["peak_budget_cap_kw"]),
         grid_signal_enabled=grid["enabled"],
