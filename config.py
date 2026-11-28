@@ -24,9 +24,17 @@ _SCHEMA = {
     "telemetry": {"stale_after_s", "stale_floor_kw", "ct_accuracy_pct"},
     "tariff": {"peak_windows", "peak_budget_cap_kw"},
     "grid_signal": {"enabled", "poll_interval_s", "max_age_s"},
-    "server": {"host", "port", "allocation_interval_s", "profile_refresh_s", "call_timeout_s",
-               "meter_sample_interval_s", "session_log_path"},
+    "server": {"host", "port", "dashboard_port", "allocation_interval_s", "profile_refresh_s",
+               "call_timeout_s", "meter_sample_interval_s", "session_log_path"},
 }
+# Optional keys: either all of a group are present, or none of them.
+_OPTIONAL = {
+    "tariff": {"peak_demand_rate_per_kw", "peak_energy_rate_per_kwh", "offpeak_energy_rate_per_kwh"},
+}
+# Sanity bounds that catch unit mistakes (cents typed as dollars). PG&E commercial
+# demand charges are tens of $/kW-month and energy rates tens of cents per kWh.
+MAX_DEMAND_RATE_PER_KW = 200.0
+MAX_ENERGY_RATE_PER_KWH = 5.0
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 J1772_MIN_CURRENT_A = 6.0       # SAE J1772: the lowest pilot current a charger may offer
 STANDARD_BREAKER_CONTINUOUS = 0.8   # NEC: a standard breaker carries 80 % continuously
@@ -86,6 +94,11 @@ class SiteConfig:
     call_timeout_s: float
     meter_sample_interval_s: int
     session_log_path: str | None
+    dashboard_port: int
+    # Tariff rates for the savings estimate (None: savings are reported in kW/kWh only).
+    peak_demand_rate_per_kw: float | None = None       # $ per kW of monthly peak-window demand
+    peak_energy_rate_per_kwh: float | None = None      # $ per kWh inside a peak window
+    offpeak_energy_rate_per_kwh: float | None = None   # $ per kWh outside the peak windows
 
     def __post_init__(self):
         # Runs on every construction, including dataclasses.replace(), so a config can
@@ -149,6 +162,34 @@ class SiteConfig:
                               "at least 1 and below telemetry.stale_after_s")
         if self.session_log_path is not None:
             _check_text("server.session_log_path", self.session_log_path)
+        if isinstance(self.dashboard_port, bool) or not isinstance(self.dashboard_port, int) \
+                or not 0 <= self.dashboard_port <= 65535:
+            raise ConfigError("server.dashboard_port must be a whole number from 0 to 65535")
+        if self.dashboard_port != 0 and self.dashboard_port == self.port:
+            raise ConfigError("server.dashboard_port must differ from server.port")
+        self._check_rates()
+
+    def _check_rates(self):
+        rates = (self.peak_demand_rate_per_kw, self.peak_energy_rate_per_kwh,
+                 self.offpeak_energy_rate_per_kwh)
+        if all(rate is None for rate in rates):
+            return
+        if any(rate is None for rate in rates):
+            raise ConfigError("tariff: give all three of peak_demand_rate_per_kw, "
+                              "peak_energy_rate_per_kwh and offpeak_energy_rate_per_kwh, or none")
+        _check("tariff.peak_demand_rate_per_kw", self.peak_demand_rate_per_kw, low=0.0,
+               high=MAX_DEMAND_RATE_PER_KW)
+        _check("tariff.peak_energy_rate_per_kwh", self.peak_energy_rate_per_kwh, low=0.0,
+               high=MAX_ENERGY_RATE_PER_KWH)
+        _check("tariff.offpeak_energy_rate_per_kwh", self.offpeak_energy_rate_per_kwh, low=0.0,
+               high=MAX_ENERGY_RATE_PER_KWH)
+        if self.offpeak_energy_rate_per_kwh > self.peak_energy_rate_per_kwh:
+            raise ConfigError("tariff.offpeak_energy_rate_per_kwh must not exceed "
+                              "tariff.peak_energy_rate_per_kwh")
+
+    @property
+    def savings_enabled(self) -> bool:
+        return self.peak_demand_rate_per_kw is not None
 
     def _check_electrical(self):
         """The kW settings must be physically possible for the installed equipment."""
@@ -219,7 +260,12 @@ def load_site_config(path: str | Path = DEFAULT_CONFIG_PATH) -> SiteConfig:
     for section, keys in _SCHEMA.items():
         if not isinstance(data[section], dict):
             raise ConfigError(f"{section} must be a JSON object")
-        _exact_keys(section, data[section], keys)
+        optional = _OPTIONAL.get(section, set())
+        present = optional & set(data[section])
+        if present and present != optional:
+            raise ConfigError(f"{section}: give all of {sorted(optional)} or none "
+                              f"(missing {sorted(optional - present)})")
+        _exact_keys(section, data[section], keys | present)
 
     site, chargers, telemetry = data["site"], data["chargers"], data["telemetry"]
     service = data["electrical_service"]
@@ -264,6 +310,10 @@ def load_site_config(path: str | Path = DEFAULT_CONFIG_PATH) -> SiteConfig:
         call_timeout_s=_num("server.call_timeout_s", server["call_timeout_s"]),
         meter_sample_interval_s=server["meter_sample_interval_s"],
         session_log_path=log_path,
+        dashboard_port=server["dashboard_port"],
+        peak_demand_rate_per_kw=_optional_num(tariff, "peak_demand_rate_per_kw"),
+        peak_energy_rate_per_kwh=_optional_num(tariff, "peak_energy_rate_per_kwh"),
+        offpeak_energy_rate_per_kwh=_optional_num(tariff, "offpeak_energy_rate_per_kwh"),
     )
 
 
@@ -280,6 +330,10 @@ def _num(name, value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"{name} must be a number, got {value!r}")
     return float(value)
+
+
+def _optional_num(section, key):
+    return _num(f"tariff.{key}", section[key]) if key in section else None
 
 
 def _check(name, value, *, low=None, high=None, low_inclusive=True, high_inclusive=True):

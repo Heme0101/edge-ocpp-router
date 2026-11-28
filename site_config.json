@@ -32,7 +32,10 @@
     "peak_windows": [
       {"start": "16:00", "end": "21:00"}
     ],
-    "peak_budget_cap_kw": 5.0
+    "peak_budget_cap_kw": 5.0,
+    "peak_demand_rate_per_kw": 25.0,
+    "peak_energy_rate_per_kwh": 0.42,
+    "offpeak_energy_rate_per_kwh": 0.18
   },
   "grid_signal": {
     "enabled": false,
@@ -42,6 +45,7 @@
   "server": {
     "host": "localhost",
     "port": 9000,
+    "dashboard_port": 8000,
     "allocation_interval_s": 2.0,
     "profile_refresh_s": 30.0,
     "call_timeout_s": 10.0,

@@ -50,6 +50,8 @@ flowchart LR
     CFG["site_config.json"] --> CONF["config.py<br/>strict validation"] --> CS
     CS -- "SetChargingProfile, ChangeConfiguration,<br/>RemoteStopTransaction" --> WS
     CS -- "one line per finished session" --> LOG[("sessions.jsonl")]
+    CS -- "state, savings" --> DASH["dashboard.py<br/>http://host:8000<br/>GET /api/state"]
+    DASH --> BROWSER["dashboard.html<br/>(polls every 1 s)"]
 ```
 
 | File | Role |
@@ -59,6 +61,8 @@ flowchart LR
 | `ocpp_meter.py` | Reads `meterValue → sampledValue` (and simple `{"soc": ..}` JSON) into fixed units. |
 | `config.py` | Loads and strictly validates `site_config.json`. |
 | `sim_chargers.py` | Simulated chargers (with battery physics) and a simulated main-feeder CT clamp. |
+| `dashboard.py` / `dashboard.html` | JSON API and live web dashboard (asyncio HTTP, no web framework). |
+| `demo.py` | One-process interactive demo: controller + simulated site + dashboard with demo controls. |
 
 ## Quick start
 
@@ -101,6 +105,77 @@ Run the tests (no internet needed; the end-to-end tests use loopback only):
 ```bash
 venv/bin/pytest -q
 ```
+
+## Live dashboard and interactive demo
+
+```bash
+venv/bin/python demo.py          # then open http://localhost:8000
+```
+
+`demo.py` runs the real controller, ten simulated chargers and a simulated CT meter in one
+process, using `site_config.demo.json`. That file describes a mid-size commercial
+building: 480 V 3-phase, a 1200 A main breaker and a 750 kVA transformer (675 kW
+continuous at power factor 0.9), a 600 kW limit with a 120 kW safety margin, and 48 A /
+208 V chargers (9.984 kW). The page refreshes every second and shows:
+
+* **Demo controls:**
+  * the building's non-EV load (0–550 kW)
+  * a 150 kW HVAC spike lasting 30 s
+  * the PG&E 4–9 PM peak window, which can be forced on or off
+* **Power flow:** grid → main panel → building and EV chargers. A capacity bar shows the
+  building load, the EV draw and the 120 kW safety margin against the 600 kW limit.
+* **Estimated savings:** this month and this session, and the peak kW shaved right now.
+* **One card per charger:**
+  * SoC
+  * priority tier
+  * allocated limit
+  * actual draw
+  * status
+  * plug-in time
+* **Recent warnings and critical alerts.**
+
+The demo controls change only the **simulated building**. The controller sees what the
+simulated CT reports, exactly as on a real site. `server.py` serves the same dashboard,
+read-only: on a live site the demo endpoints answer 404, so nothing on the network can
+fake the building load. The page loads Tailwind from its CDN, so the browser needs
+internet access for styling.
+
+| Endpoint | Body | |
+|---|---|---|
+| `GET /` | | The dashboard page. |
+| `GET /api/state` | | Site, telemetry, peak window, savings, chargers, alerts (JSON). |
+| `POST /api/demo/load` | `{"kw": 420}` | Building non-EV load (demo only). |
+| `POST /api/demo/spike` | | 150 kW for 30 s (demo only). |
+| `POST /api/demo/toggle-peak` | none, or `{"active": true\|false\|null}` | Flip, force, or (`null`) follow the schedule (demo only). |
+
+POSTs must be `Content-Type: application/json`. There is no TLS and no login: keep the
+dashboard port on a trusted network.
+
+### How savings are estimated
+
+Savings are counted only while a peak window is in effect and the CT reading is fresh.
+Each cycle compares the measured site load with the load the site **would** have drawn
+unmanaged. "Unmanaged" assumes every charging car draws its charger's full rating
+(`max_charger_kw`). A car that is full, tapered, or reports that it is not drawing counts
+at its actual draw.
+
+* **Demand charge avoided** = (highest 15-minute average peak-window demand unmanaged −
+  the same, measured) × `peak_demand_rate_per_kw`.
+  * Both maxima are this calendar month's, in site-local time.
+  * Demand is averaged per 15-minute clock interval, as PG&E bills it.
+  * The interval in progress counts with its average so far.
+* **Energy moved off-peak** = kWh the EVs did not draw during the peak ×
+  (`peak_energy_rate_per_kwh` − `offpeak_energy_rate_per_kwh`). This assumes that energy
+  is delivered later at the off-peak rate.
+* **This session** = energy savings since the server started. Demand charges are monthly,
+  so they appear only under the month. Each charger card shows its own share, and the
+  finished-session log records `peak_shifted_kwh`.
+* All dollar amounts are rounded **down** to the cent.
+* Savings live in memory, so a restart starts the month's count again.
+
+These are estimates for demonstrating value, **not a bill**. Real demand charges depend on
+the rate schedule (e.g. B-19 vs. B-20, seasonal rates, and max-demand charges outside
+the peak), and on whether unmanaged cars would really have charged at full power then.
 
 ### Simulator options
 
@@ -257,8 +332,10 @@ and end SoC. Each finished session is appended as one JSON line to `session_log_
 
 ## Configuration (`site_config.json`)
 
-Every key is required. An unknown key, a wrong type or an out-of-range value stops the
-server at startup with a message naming the key.
+Every key is required, except the three tariff rates. Give all three or none; without
+them, savings are shown in kW and kWh only. An unknown key, a wrong type or an
+out-of-range value stops the server at startup with a message naming the key. The rate
+bounds catch cents typed as dollars.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -283,10 +360,14 @@ server at startup with a message naming the key.
 | `telemetry.ct_accuracy_pct` | 1.0 | The CT meter's accuracy class. Cuts within it may be held, site-wide (800 W here). |
 | `tariff.peak_windows` | 16:00–21:00 | Daily windows, site time; `end` < `start` wraps past midnight. |
 | `tariff.peak_budget_cap_kw` | 5.0 | EV budget cap inside a peak window. |
+| `tariff.peak_demand_rate_per_kw` | 25.0 | *Optional.* $ per kW of monthly peak-window demand (0–200). |
+| `tariff.peak_energy_rate_per_kwh` | 0.42 | *Optional.* $ per kWh inside a peak window (0–5). |
+| `tariff.offpeak_energy_rate_per_kwh` | 0.18 | *Optional.* $ per kWh outside it; not above the peak rate. |
 | `grid_signal.enabled` | false | Run the grid signal poller. |
 | `grid_signal.poll_interval_s` | 60.0 | Seconds between polls. |
 | `grid_signal.max_age_s` | 300.0 | Older signals are ignored (tariff windows apply). |
 | `server.host` / `server.port` | localhost / 9000 | Where the server listens. |
+| `server.dashboard_port` | 8000 | Dashboard and JSON API (same host); must differ from `port`. |
 | `server.allocation_interval_s` | 2.0 | Seconds between allocation cycles. |
 | `server.profile_refresh_s` | 30.0 | Re-send an unchanged limit this often. |
 | `server.call_timeout_s` | 10.0 | Wait this long for a charger's reply. |

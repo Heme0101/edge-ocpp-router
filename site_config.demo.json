@@ -1,0 +1,55 @@
+{
+  "site": {
+    "panel_limit_kw": 600.0,
+    "safety_margin_kw": 120.0,
+    "site_meter_id": "SITE_METER",
+    "timezone": "America/Los_Angeles"
+  },
+  "electrical_service": {
+    "voltage_v": 480.0,
+    "phases": 3,
+    "main_breaker_a": 1200.0,
+    "breaker_100_percent_rated": false,
+    "transformer_kva": 750.0,
+    "min_power_factor": 0.9
+  },
+  "chargers": {
+    "voltage_v": 208.0,
+    "max_current_a": 48.0,
+    "max_charger_kw": 9.984,
+    "min_charger_kw": 1.44,
+    "min_increase_w": 100.0,
+    "taper_threshold_w": 100.0,
+    "taper_grace_s": 30.0,
+    "offline_session_timeout_s": 300.0
+  },
+  "telemetry": {
+    "stale_after_s": 15.0,
+    "stale_floor_kw": 2.0,
+    "ct_accuracy_pct": 0.5
+  },
+  "tariff": {
+    "peak_windows": [
+      {"start": "16:00", "end": "21:00"}
+    ],
+    "peak_budget_cap_kw": 5.0,
+    "peak_demand_rate_per_kw": 25.0,
+    "peak_energy_rate_per_kwh": 0.42,
+    "offpeak_energy_rate_per_kwh": 0.18
+  },
+  "grid_signal": {
+    "enabled": false,
+    "poll_interval_s": 60.0,
+    "max_age_s": 300.0
+  },
+  "server": {
+    "host": "localhost",
+    "port": 9000,
+    "dashboard_port": 8000,
+    "allocation_interval_s": 1.0,
+    "profile_refresh_s": 30.0,
+    "call_timeout_s": 10.0,
+    "meter_sample_interval_s": 1,
+    "session_log_path": null
+  }
+}

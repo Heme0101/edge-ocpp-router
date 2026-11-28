@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edge OCPP Router</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { background: #020617; }
+  .flow { stroke-dasharray: 6 10; animation: flow linear infinite; }
+  .flow.idle { animation: none; opacity: .25; }
+  @keyframes flow { to { stroke-dashoffset: -32; } }
+  .margin-zone { background: repeating-linear-gradient(135deg, rgba(245,158,11,.30) 0 6px, rgba(245,158,11,.12) 6px 12px); }
+  input[type=range] { accent-color: #38bdf8; }
+  .tabular { font-variant-numeric: tabular-nums; }
+  @media (prefers-reduced-motion: reduce) { .flow { animation: none; } }
+</style>
+</head>
+<body class="min-h-screen text-slate-100 antialiased">
+<div class="mx-auto max-w-7xl px-4 py-6 space-y-5">
+
+  <!-- Header -->
+  <header class="flex flex-wrap items-center justify-between gap-3">
+    <div>
+      <h1 class="text-xl font-semibold tracking-tight">Edge OCPP Router</h1>
+      <p class="text-sm text-slate-400">EV load management · OCPP 1.6J · live site view</p>
+    </div>
+    <div class="flex flex-wrap items-center gap-2 text-xs">
+      <span id="peak-pill" class="rounded-full px-3 py-1 ring-1 ring-white/10 bg-slate-800 text-slate-300">Off-peak</span>
+      <span id="ct-pill" class="rounded-full px-3 py-1 ring-1 ring-white/10 bg-slate-800 text-slate-300">CT: waiting</span>
+      <span id="conn-pill" class="rounded-full px-3 py-1 ring-1 ring-white/10 bg-slate-800 text-slate-300">Connecting…</span>
+      <span id="clock" class="tabular text-slate-500"></span>
+    </div>
+  </header>
+
+  <!-- Demo controls -->
+  <section id="controls" class="hidden rounded-2xl bg-slate-900/70 ring-1 ring-sky-400/20 p-4">
+    <div class="flex flex-wrap items-center gap-x-8 gap-y-4">
+      <div class="text-xs font-semibold uppercase tracking-wider text-sky-300">Demo controls<span class="block font-normal normal-case tracking-normal text-slate-500">simulated building</span></div>
+      <label class="flex min-w-[16rem] flex-1 items-center gap-3">
+        <span class="whitespace-nowrap text-sm text-slate-300">Building non-EV load</span>
+        <input id="load-slider" type="range" min="0" max="550" step="5" value="0" class="w-full">
+        <span id="load-value" class="tabular w-24 shrink-0 whitespace-nowrap text-right text-sm font-semibold">— kW</span>
+      </label>
+      <button id="spike-btn" type="button" class="rounded-xl bg-orange-500/90 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-60">Trigger 150 kW HVAC Spike</button>
+      <button id="peak-toggle" type="button" role="switch" aria-checked="false" class="flex items-center gap-3 text-sm text-slate-300">
+        <span id="peak-track" class="relative inline-flex h-6 w-11 items-center rounded-full bg-slate-700 transition">
+          <span id="peak-knob" class="inline-block h-5 w-5 translate-x-0.5 rounded-full bg-white shadow transition"></span>
+        </span>
+        PG&amp;E 4–9 PM Peak Window
+      </button>
+      <span id="control-error" class="text-xs text-rose-400"></span>
+    </div>
+  </section>
+
+  <!-- Flow + savings -->
+  <section class="grid gap-5 lg:grid-cols-3">
+    <div class="rounded-2xl bg-slate-900/60 ring-1 ring-white/10 p-4 lg:col-span-2">
+      <div class="mb-2 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-slate-300">Power flow</h2>
+        <span id="budget-label" class="tabular text-xs text-slate-400"></span>
+      </div>
+      <svg viewBox="0 0 720 300" class="w-full" role="img" aria-label="Power flow from the grid through the main panel to the building and the EV chargers">
+        <defs>
+          <filter id="glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+        </defs>
+        <!-- wires -->
+        <path id="wire-grid" d="M150 150 H300" fill="none" stroke="#38bdf8" stroke-linecap="butt" class="flow"/>
+        <path id="wire-bldg" d="M420 135 C480 135 480 70 540 70" fill="none" stroke="#818cf8" stroke-linecap="butt" class="flow"/>
+        <path id="wire-ev" d="M420 165 C480 165 480 230 540 230" fill="none" stroke="#34d399" stroke-linecap="butt" class="flow"/>
+        <!-- nodes -->
+        <g>
+          <rect x="30" y="110" width="120" height="80" rx="14" fill="#0f172a" stroke="#38bdf8" stroke-opacity=".5"/>
+          <text x="90" y="140" text-anchor="middle" fill="#94a3b8" font-size="12">Utility grid</text>
+          <text id="t-grid" x="90" y="168" text-anchor="middle" fill="#e2e8f0" font-size="18" font-weight="600" class="tabular">—</text>
+        </g>
+        <g>
+          <rect id="panel-box" x="300" y="95" width="120" height="110" rx="14" fill="#0f172a" stroke="#22c55e" stroke-width="2" filter="url(#glow)"/>
+          <text x="360" y="125" text-anchor="middle" fill="#94a3b8" font-size="12">Main panel</text>
+          <text id="t-panel" x="360" y="153" text-anchor="middle" fill="#e2e8f0" font-size="18" font-weight="600" class="tabular">—</text>
+          <text id="t-panel-pct" x="360" y="180" text-anchor="middle" fill="#94a3b8" font-size="12" class="tabular">—</text>
+        </g>
+        <g>
+          <rect x="540" y="35" width="150" height="70" rx="14" fill="#0f172a" stroke="#818cf8" stroke-opacity=".5"/>
+          <text x="615" y="62" text-anchor="middle" fill="#94a3b8" font-size="12">Building (non-EV)</text>
+          <text id="t-bldg" x="615" y="88" text-anchor="middle" fill="#e2e8f0" font-size="18" font-weight="600" class="tabular">—</text>
+        </g>
+        <g>
+          <rect x="540" y="195" width="150" height="70" rx="14" fill="#0f172a" stroke="#34d399" stroke-opacity=".5"/>
+          <text id="t-ev-title" x="615" y="222" text-anchor="middle" fill="#94a3b8" font-size="12">EV chargers</text>
+          <text id="t-ev" x="615" y="248" text-anchor="middle" fill="#e2e8f0" font-size="18" font-weight="600" class="tabular">—</text>
+        </g>
+      </svg>
+
+      <!-- capacity bar -->
+      <div class="mt-3">
+        <div class="mb-1 flex justify-between text-xs text-slate-400">
+          <span>Main panel capacity</span>
+          <span id="cap-scale" class="tabular"></span>
+        </div>
+        <div class="relative h-6 w-full overflow-hidden rounded-lg bg-slate-800 ring-1 ring-white/10">
+          <div id="bar-margin" class="margin-zone absolute inset-y-0 right-0"></div>
+          <div id="bar-bldg" class="absolute inset-y-0 left-0 bg-indigo-400/90 transition-all duration-500"></div>
+          <div id="bar-ev" class="absolute inset-y-0 bg-emerald-400/90 transition-all duration-500"></div>
+          <div id="bar-limit" class="absolute inset-y-0 w-0.5 bg-amber-300"></div>
+        </div>
+        <div class="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-300 tabular">
+          <span><i class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-indigo-400 align-middle"></i>Building non-EV <b id="l-bldg">—</b></span>
+          <span><i class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-emerald-400 align-middle"></i>Active EV draw <b id="l-ev">—</b></span>
+          <span><i class="margin-zone mr-1 inline-block h-2.5 w-2.5 rounded-sm align-middle"></i>Safety margin <b id="l-margin">—</b></span>
+          <span class="text-slate-400">Headroom <b id="l-free">—</b></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="space-y-5">
+      <div class="rounded-2xl bg-gradient-to-br from-emerald-500/15 to-slate-900/60 ring-1 ring-emerald-400/20 p-4">
+        <div class="flex items-start justify-between">
+          <h2 class="text-sm font-semibold text-slate-300">Estimated PG&amp;E savings</h2>
+          <span id="shaved-badge" class="tabular rounded-full bg-emerald-400/15 px-2.5 py-1 text-xs font-semibold text-emerald-300 ring-1 ring-emerald-400/30">0.0 kW shaved</span>
+        </div>
+        <p class="mt-3 text-xs uppercase tracking-wider text-slate-400">This month <span id="month-label"></span></p>
+        <p id="month-total" class="tabular text-4xl font-bold text-emerald-300">$0.00</p>
+        <dl class="mt-3 space-y-1 text-sm tabular">
+          <div class="flex justify-between"><dt class="text-slate-400">Demand charge avoided</dt><dd id="month-demand">—</dd></div>
+          <div class="flex justify-between"><dt class="pl-3 text-xs text-slate-500">15-min peak shaved</dt><dd id="month-shaved" class="text-xs text-slate-400">—</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-400">Energy moved off-peak</dt><dd id="month-energy">—</dd></div>
+          <div class="flex justify-between"><dt class="pl-3 text-xs text-slate-500">kWh shifted</dt><dd id="month-kwh" class="text-xs text-slate-400">—</dd></div>
+        </dl>
+        <div class="mt-4 border-t border-white/10 pt-3">
+          <p class="text-xs uppercase tracking-wider text-slate-400">This session (since start)</p>
+          <div class="mt-1 flex items-baseline justify-between tabular">
+            <span id="run-total" class="text-2xl font-semibold">$0.00</span>
+            <span id="run-kwh" class="text-xs text-slate-400">0.000 kWh shifted</span>
+          </div>
+        </div>
+        <p id="rates" class="mt-3 text-[11px] leading-snug text-slate-500"></p>
+      </div>
+
+      <div class="rounded-2xl bg-slate-900/60 ring-1 ring-white/10 p-4 text-sm">
+        <h2 class="mb-2 text-sm font-semibold text-slate-300">Controller</h2>
+        <dl class="space-y-1 tabular">
+          <div class="flex justify-between"><dt class="text-slate-400">EV budget</dt><dd id="c-budget">—</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-400">EV limits in force</dt><dd id="c-limits">—</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-400">Cap</dt><dd id="c-cap">—</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-400">Panel limit / continuous rating</dt><dd id="c-panel">—</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-400">CT reading age</dt><dd id="c-age">—</dd></div>
+        </dl>
+      </div>
+    </div>
+  </section>
+
+  <!-- Chargers -->
+  <section>
+    <div class="mb-3 flex items-baseline justify-between">
+      <h2 class="text-sm font-semibold text-slate-300">Chargers</h2>
+      <span id="charger-count" class="text-xs text-slate-500"></span>
+    </div>
+    <div id="cards" class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"></div>
+    <p id="no-chargers" class="hidden rounded-2xl bg-slate-900/60 p-6 text-center text-sm text-slate-500 ring-1 ring-white/10">No chargers connected yet.</p>
+  </section>
+
+  <!-- Alerts -->
+  <section class="rounded-2xl bg-slate-900/60 ring-1 ring-white/10 p-4">
+    <h2 class="mb-2 text-sm font-semibold text-slate-300">Safety &amp; escalation alerts</h2>
+    <ul id="alerts" class="max-h-72 space-y-1 overflow-y-auto text-xs"></ul>
+    <p id="no-alerts" class="text-xs text-slate-500">No alerts.</p>
+  </section>
+
+  <footer class="pb-4 text-[11px] leading-relaxed text-slate-500">
+    Savings are estimates: unmanaged demand assumes every charging car would draw its charger's full rating;
+    demand is averaged per 15 minutes in the peak window; energy kept out of the peak is assumed to be bought later at the off-peak rate.
+    Not a utility bill.
+  </footer>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const POLL_MS = 1000;
+let lastState = null, sliderBusyUntil = 0, sliderTimer = null;
+
+const fmtKw = (v, d = 1) => (v === null || v === undefined) ? "—" : `${Number(v).toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d})} kW`;
+const fmtW = (v) => (v === null || v === undefined) ? "—" : `${Math.round(v).toLocaleString()} W`;
+const fmtUsd = (v) => (v === null || v === undefined) ? "—" : `$${Number(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+const fmtDur = (s) => { if (s === null || s === undefined) return "—"; s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m ${String(x).padStart(2, "0")}s`; };
+
+function pill(el, text, tone) {
+  const tones = {
+    ok: "bg-emerald-500/15 text-emerald-300 ring-emerald-400/30",
+    warn: "bg-amber-500/15 text-amber-300 ring-amber-400/30",
+    bad: "bg-rose-500/15 text-rose-300 ring-rose-400/30",
+    info: "bg-sky-500/15 text-sky-300 ring-sky-400/30",
+    idle: "bg-slate-800 text-slate-300 ring-white/10",
+  };
+  el.className = `rounded-full px-3 py-1 ring-1 ${tones[tone] || tones.idle}`;
+  el.textContent = text;
+}
+
+function setWire(id, kw, scaleKw) {
+  const el = $(id), frac = Math.max(0, Math.min(1, (kw || 0) / Math.max(1, scaleKw)));
+  el.setAttribute("stroke-width", (2 + frac * 12).toFixed(1));
+  el.classList.toggle("idle", !(kw > 0.05));
+  el.style.animationDuration = `${(2.4 - frac * 1.9).toFixed(2)}s`;
+}
+
+function render(s) {
+  const site = s.site, sav = s.savings, peak = s.peak;
+  $("clock").textContent = new Date(s.time).toLocaleTimeString();
+
+  // header pills
+  pill($("peak-pill"), peak.active ? `Peak window ON${peak.override !== null ? " (forced)" : ""} · cap ${fmtKw(peak.budget_cap_kw)}` : `Off-peak${peak.override !== null ? " (forced)" : ""}`, peak.active ? "warn" : "idle");
+  const t = s.telemetry;
+  if (t.state === "ok") pill($("ct-pill"), `CT live · ${fmtKw(site.site_load_kw)}`, site.over_panel ? "bad" : "ok");
+  else if (t.state === "stale") pill($("ct-pill"), `CT stale (${t.age_s ?? "—"} s) · safe floor`, "bad");
+  else if (t.state === "missing") pill($("ct-pill"), "CT missing · safe floor", "bad");
+  else pill($("ct-pill"), "CT: waiting for first reading", "idle");
+
+  // flow diagram
+  const other = site.other_load_kw, ev = site.ev_draw_kw, total = site.site_load_kw;
+  const scale = site.panel_limit_kw;
+  setWire("wire-grid", total, scale);
+  setWire("wire-bldg", other, scale);
+  setWire("wire-ev", ev, scale);
+  $("t-grid").textContent = fmtKw(total);
+  $("t-panel").textContent = fmtKw(total);
+  const pct = total === null ? null : total / site.panel_limit_kw * 100;
+  $("t-panel-pct").textContent = pct === null ? "—" : `${pct.toFixed(0)}% of ${fmtKw(site.panel_limit_kw, 0)}`;
+  $("panel-box").setAttribute("stroke", pct === null ? "#475569" : pct > 100 ? "#f43f5e" : pct > site.usable_kw / site.panel_limit_kw * 100 ? "#f59e0b" : "#22c55e");
+  $("t-bldg").textContent = fmtKw(other);
+  $("t-ev").textContent = fmtKw(ev);
+  const charging = s.chargers.filter((c) => c.car && !c.charging_stopped).length;
+  $("t-ev-title").textContent = `EV chargers · ${charging} car${charging === 1 ? "" : "s"}`;
+  $("budget-label").textContent = site.budget_kw === null ? "" : `EV budget ${fmtKw(site.budget_kw)}`;
+
+  // capacity bar (scale: the panel limit, or the reading if it is above it)
+  const max = Math.max(site.panel_limit_kw, total || 0);
+  const w = (kw) => `${Math.max(0, (kw || 0) / max * 100)}%`;
+  $("bar-bldg").style.width = w(other);
+  $("bar-ev").style.left = w(other);
+  $("bar-ev").style.width = w(ev);
+  $("bar-margin").style.width = w(site.safety_margin_kw);
+  $("bar-margin").style.right = `${(max - site.panel_limit_kw) / max * 100}%`;
+  $("bar-limit").style.left = `calc(${site.panel_limit_kw / max * 100}% - 2px)`;
+  $("cap-scale").textContent = `0 – ${fmtKw(site.panel_limit_kw, 0)} panel limit`;
+  $("l-bldg").textContent = fmtKw(other);
+  $("l-ev").textContent = fmtKw(ev);
+  $("l-margin").textContent = fmtKw(site.safety_margin_kw, 0);
+  $("l-free").textContent = total === null ? "—" : fmtKw(Math.max(0, site.usable_kw - total));
+
+  // savings
+  const m = sav.month;
+  $("shaved-badge").textContent = `${fmtKw(sav.shaved_now_kw)} shaved now`;
+  $("month-label").textContent = m.month ? `(${m.month})` : "";
+  $("month-total").textContent = sav.enabled ? fmtUsd(m.total_usd) : "—";
+  $("month-demand").textContent = fmtUsd(m.demand_savings_usd);
+  $("month-shaved").textContent = `${fmtKw(m.peak_kw_shaved)} (${fmtKw(m.peak_demand_unmanaged_kw)} → ${fmtKw(m.peak_demand_actual_kw)})`;
+  $("month-energy").textContent = fmtUsd(m.energy_savings_usd);
+  $("month-kwh").textContent = `${m.energy_shifted_kwh.toFixed(3)} kWh`;
+  $("run-total").textContent = sav.enabled ? fmtUsd(sav.run.energy_savings_usd) : "—";
+  $("run-kwh").textContent = `${sav.run.energy_shifted_kwh.toFixed(3)} kWh shifted · max ${fmtKw(sav.run.max_shaved_kw)} shaved`;
+  const r = sav.rates;
+  $("rates").textContent = sav.enabled
+    ? `Rates: $${r.peak_demand_per_kw}/kW peak demand · $${r.peak_energy_per_kwh}/kWh peak · $${r.offpeak_energy_per_kwh}/kWh off-peak. Peak window ${peak.windows.join(", ")} ${peak.timezone}.`
+    : "Tariff rates are not configured in site_config.json: savings are shown in kW and kWh only.";
+
+  // controller panel
+  $("c-budget").textContent = fmtKw(site.budget_kw, 3);
+  $("c-limits").textContent = fmtKw(site.ev_limit_kw, 3);
+  $("c-cap").textContent = site.cap_source === "peak" ? `peak window, ${fmtKw(site.cap_kw)}` : site.cap_source === "grid" ? `grid signal, ${fmtKw(site.cap_kw)}` : "none";
+  $("c-panel").textContent = `${fmtKw(site.panel_limit_kw, 0)} / ${fmtKw(site.continuous_capacity_kw, 0)}`;
+  $("c-age").textContent = t.age_s === null ? "—" : `${t.age_s} s (stale after ${t.stale_after_s} s)`;
+
+  renderCards(s.chargers, site.max_charger_kw);
+  renderAlerts(s.alerts);
+  renderControls(s.demo, peak);
+}
+
+// ---- charger cards (keyed: elements are reused, not rebuilt) ----
+const cardEls = new Map();
+const TIER_TONE = { High: "bg-rose-500/15 text-rose-300 ring-rose-400/30", Medium: "bg-amber-500/15 text-amber-300 ring-amber-400/30", Low: "bg-sky-500/15 text-sky-300 ring-sky-400/30", None: "bg-slate-700/60 text-slate-300 ring-white/10" };
+function statusTone(c) {
+  if (!c.online) return "bad";
+  if (c.uncontrollable || c.status === "Faulted") return "bad";
+  if (c.status === "Charging") return "ok";
+  if (c.status === "SuspendedEV" || c.status === "SuspendedEVSE" || c.status === "Finishing") return "warn";
+  return "idle";
+}
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+
+function makeCard() {
+  const root = el("article", "rounded-2xl bg-slate-900/60 ring-1 ring-white/10 p-4 space-y-3");
+  const head = el("div", "flex items-center justify-between gap-2");
+  const id = el("h3", "font-semibold tracking-tight truncate");
+  const status = el("span", "");
+  head.append(id, status);
+  const socRow = el("div", "space-y-1");
+  const socTop = el("div", "flex items-baseline justify-between");
+  const soc = el("span", "tabular text-2xl font-bold");
+  const tier = el("span", "rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1");
+  socTop.append(soc, tier);
+  const socBar = el("div", "h-1.5 w-full overflow-hidden rounded bg-slate-800");
+  const socFill = el("div", "h-full rounded bg-gradient-to-r from-emerald-500 to-emerald-300 transition-all duration-700");
+  socBar.append(socFill);
+  socRow.append(socTop, socBar);
+  const grid = el("dl", "grid grid-cols-2 gap-x-3 gap-y-1 text-xs tabular");
+  const field = (label) => { const d = el("div", ""); d.append(el("dt", "text-slate-500", label)); const v = el("dd", "text-sm text-slate-200"); d.append(v); grid.append(d); return v; };
+  const limit = field("Allocated limit"), actual = field("Actual draw"), plugged = field("Plugged in"), saved = field("Peak savings");
+  const drawBar = el("div", "h-1 w-full overflow-hidden rounded bg-slate-800");
+  const drawFill = el("div", "h-full rounded bg-sky-400 transition-all duration-500");
+  drawBar.append(drawFill);
+  const flags = el("p", "text-[11px] text-amber-300 min-h-[1rem]");
+  root.append(head, socRow, grid, drawBar, flags);
+  return { root, id, status, soc, tier, socFill, limit, actual, plugged, saved, drawFill, flags, socRow };
+}
+
+function renderCards(chargers, maxKw) {
+  const box = $("cards"), seen = new Set();
+  $("no-chargers").classList.toggle("hidden", chargers.length > 0);
+  $("charger-count").textContent = chargers.length ? `${chargers.filter((c) => c.online).length} online · ${chargers.length} total` : "";
+  chargers.forEach((c, i) => {
+    seen.add(c.id);
+    let card = cardEls.get(c.id);
+    if (!card) { card = makeCard(); cardEls.set(c.id, card); }
+    if (box.children[i] !== card.root) box.insertBefore(card.root, box.children[i] || null);
+    card.id.textContent = c.id;
+    pill(card.status, c.uncontrollable ? "Uncontrollable" : c.status, statusTone(c));
+    card.status.className += " text-[11px]";
+    if (!c.car) {
+      card.soc.textContent = "No car";
+      card.tier.textContent = ""; card.tier.className = "hidden";
+      card.socFill.style.width = "0%";
+      [card.limit, card.actual, card.plugged, card.saved].forEach((v) => v.textContent = "—");
+      card.drawFill.style.width = "0%"; card.flags.textContent = "";
+      return;
+    }
+    card.soc.textContent = c.soc === null ? `${c.kwh_delivered.toFixed(2)} kWh` : `${c.soc.toFixed(1)}%`;
+    card.socFill.style.width = c.soc === null ? "0%" : `${c.soc}%`;
+    const tierName = c.priority.name;
+    card.tier.className = `rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1 ${TIER_TONE[tierName] || TIER_TONE.None}`;
+    card.tier.textContent = `${tierName} priority · ${c.priority.basis === "SoC" ? "SoC" : "kWh"}`;
+    const ramping = c.target_w !== null && c.limit_w !== null && c.target_w !== c.limit_w && !c.charging_stopped;
+    card.limit.textContent = c.limit_w === null ? "pending" : `${fmtW(c.limit_w)}${ramping ? ` → ${fmtW(c.target_w)}` : ""}`;
+    card.actual.textContent = c.actual_w === null ? "no recent reading" : fmtW(c.actual_w);
+    card.plugged.textContent = fmtDur(c.plugged_in_s);
+    card.saved.textContent = c.savings_usd === null ? `${c.peak_shifted_kwh.toFixed(3)} kWh` : fmtUsd(c.savings_usd);
+    card.drawFill.style.width = `${Math.min(100, (c.actual_w || 0) / (maxKw * 1000) * 100)}%`;
+    const f = [];
+    if (c.soc === null) f.push("SoC not reported: priority by energy delivered");
+    if (c.tapered) f.push("Tapered: held at minimum, power reclaimed");
+    if (c.fallback_profile) f.push("Limited via ChargePointMaxProfile");
+    if (c.uncontrollable) f.push("Refused all limits: stop requested");
+    if (c.charging_stopped) f.push("Transaction ended");
+    card.flags.textContent = f.join(" · ");
+  });
+  for (const [id, card] of cardEls) if (!seen.has(id)) { card.root.remove(); cardEls.delete(id); }
+}
+
+// ---- alerts ----
+let alertsKey = "";
+function renderAlerts(alerts) {
+  const key = alerts.length ? `${alerts.length}|${alerts[0].time}|${alerts[0].message}` : "";
+  if (key === alertsKey) return;
+  alertsKey = key;
+  const list = $("alerts");
+  list.replaceChildren();
+  $("no-alerts").classList.toggle("hidden", alerts.length > 0);
+  const tone = { CRITICAL: "text-rose-300 bg-rose-500/10", ERROR: "text-rose-300 bg-rose-500/5", WARNING: "text-amber-200 bg-amber-500/5" };
+  for (const a of alerts) {
+    const li = el("li", `flex gap-3 rounded-lg px-2 py-1.5 ${tone[a.level] || "text-slate-300"}`);
+    li.append(el("span", "tabular shrink-0 text-slate-500", new Date(a.time).toLocaleTimeString()),
+              el("span", "shrink-0 w-16 font-semibold", a.level),
+              el("span", "break-words", a.message));
+    list.append(li);
+  }
+}
+
+// ---- demo controls ----
+function renderControls(demo, peak) {
+  $("controls").classList.toggle("hidden", !demo.enabled);
+  if (!demo.enabled) return;
+  const slider = $("load-slider");
+  slider.max = demo.max_base_load_kw;
+  if (Date.now() > sliderBusyUntil) {
+    slider.value = demo.base_load_kw;
+    $("load-value").textContent = fmtKw(demo.base_load_kw, 0);
+  }
+  const btn = $("spike-btn");
+  btn.disabled = demo.spike_remaining_s > 0;
+  btn.textContent = demo.spike_remaining_s > 0 ? `HVAC spike active · ${Math.ceil(demo.spike_remaining_s)} s` : `Trigger ${demo.spike_kw} kW HVAC Spike`;
+  $("peak-toggle").setAttribute("aria-checked", String(peak.active));
+  $("peak-track").className = `relative inline-flex h-6 w-11 items-center rounded-full transition ${peak.active ? "bg-amber-500" : "bg-slate-700"}`;
+  $("peak-knob").className = `inline-block h-5 w-5 rounded-full bg-white shadow transition ${peak.active ? "translate-x-5" : "translate-x-0.5"}`;
+}
+
+async function post(path, body) {
+  $("control-error").textContent = "";
+  try {
+    const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    poll();
+  } catch (err) {
+    $("control-error").textContent = String(err.message || err);
+  }
+}
+
+$("load-slider").addEventListener("input", (e) => {
+  sliderBusyUntil = Date.now() + 1500;
+  $("load-value").textContent = fmtKw(Number(e.target.value), 0);
+  clearTimeout(sliderTimer);
+  sliderTimer = setTimeout(() => post("/api/demo/load", { kw: Number(e.target.value) }), 150);
+});
+$("spike-btn").addEventListener("click", () => post("/api/demo/spike"));
+$("peak-toggle").addEventListener("click", () => post("/api/demo/toggle-peak"));
+
+// ---- polling ----
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const res = await fetch("/api/state", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    lastState = await res.json();
+    render(lastState);
+    pill($("conn-pill"), "Live", "ok");
+    document.body.style.opacity = "1";
+  } catch (err) {
+    pill($("conn-pill"), "Disconnected", "bad");
+    if (lastState) document.body.style.opacity = "0.6";
+  } finally {
+    polling = false;
+  }
+}
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

@@ -103,6 +103,7 @@ class Session:
     overdraw_reported: bool = False         # drew over its accepted limit (logged once)
     under_default: bool = False             # began under the accepted 0 W site default
     used_fallback: bool = False             # limited through ChargePointMaxProfile
+    peak_shift_kwh: float = 0.0             # energy moved out of peak windows (savings estimate)
 
     @property
     def label(self) -> str:
@@ -166,6 +167,7 @@ class Plan:
     send_w: dict                            # (charger_id, connector_id) -> W safe to send now
     sessions: dict                          # (charger_id, connector_id) -> Session
     tapered: set
+    in_peak: bool = False                   # a tariff peak window is in effect
 
 
 class CentralSystem:
@@ -190,6 +192,9 @@ class CentralSystem:
         self._telemetry_state: str | None = None   # "waiting", "missing", "stale" or "ok"
         self._started = monotonic()
         self._last_cap_source: str | None = None
+        self.peak_override: bool | None = None     # demo: force the peak window on/off
+        self.last_plan: Plan | None = None
+        self.savings = gateway.SavingsTracker(cfg, max_gap_s=max(10.0, 3 * cfg.allocation_interval_s))
         self._handlers = {
             "BootNotification": self._on_boot,
             "Heartbeat": self._on_heartbeat,
@@ -581,6 +586,7 @@ class CentralSystem:
             "end_reason": reason,
             "used_charge_point_max_profile": session.used_fallback,
             "uncontrollable": session.uncontrollable,
+            "peak_shifted_kwh": round(session.peak_shift_kwh, 3),
         }
         self.completed_sessions.append(record)
         self._write_session_log(record)
@@ -616,6 +622,31 @@ class CentralSystem:
             self.grid_signal_cap_kw = self.grid_signal_at = None
             return
         self.grid_signal_cap_kw, self.grid_signal_at = value, self._monotonic()
+
+    def monotonic(self) -> float:
+        return self._monotonic()
+
+    def wall_clock(self) -> datetime:
+        return self._clock()
+
+    @property
+    def telemetry_state(self) -> str | None:
+        """'waiting', 'missing', 'stale' or 'ok' as of the last cycle (None before the first)."""
+        return self._telemetry_state
+
+    def peak_active(self, now: datetime) -> bool:
+        """Is a tariff peak window in effect? The configured windows, unless overridden."""
+        return gateway.in_peak_window(self.cfg, now) if self.peak_override is None else self.peak_override
+
+    def set_peak_override(self, active: bool | None):
+        """Force the peak window on (True) or off (False), or follow the clock (None)."""
+        if active is not None and not isinstance(active, bool):
+            raise TypeError("active must be True, False or None")
+        if active != self.peak_override:
+            log.info("peak window %s", "follows the configured schedule" if active is None
+                     else f"forced {'ON' if active else 'OFF'}")
+        self.peak_override = active
+        self.wake_now()
 
     # ---------------------------------------------------------------- allocation cycle
 
@@ -657,8 +688,9 @@ class CentralSystem:
                                                            self._other_load_prev)
             self._other_load_prev = other_load_kw
         grid_age = None if self.grid_signal_at is None else now - self.grid_signal_at
+        in_peak = self.peak_active(self._clock())
         decision = gateway.decide_ev_budget(cfg, other_load_kw, telemetry_age,
-                                            self.grid_signal_cap_kw, grid_age, self._clock())
+                                            self.grid_signal_cap_kw, grid_age, self._clock(), in_peak)
         self._log_budget_transitions(decision)
 
         weights = {key: gateway.session_weight(s.soc, s.kwh_delivered) for key, s in sessions.items()}
@@ -676,7 +708,7 @@ class CentralSystem:
         send_w = gateway.hold_small_cuts(send_w, committed_w, accepted_w,
                                          gateway.watts_floor(cfg.ct_tolerance_kw))
         return Plan(decision, self.site_load_kw, other_load_kw, reserved_w, targets_w, send_w,
-                    sessions, tapered)
+                    sessions, tapered, in_peak)
 
     def _ev_draw_bounds_kw(self, session: Session, connector: Connector, t_ct: float):
         """(low, high): bounds on this car's draw at the instant the CT reading was taken.
@@ -853,7 +885,37 @@ class CentralSystem:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             tasks.append(task)
+        self.last_plan = plan
+        try:
+            self._track_savings(plan)
+        except Exception:                   # bookkeeping must never stop the control loop
+            log.exception("savings tracking failed for this cycle")
         return tasks
+
+    def actual_draw_kw(self, session: Session, now: float) -> float:
+        """A car's draw now: its last power reading while fresh, otherwise (unknown) its
+        committed limit, which can only make the savings estimate smaller."""
+        if session.power_w is not None and session.power_at is not None \
+                and now - session.power_at <= self.cfg.telemetry_stale_after_s:
+            return max(0.0, session.power_w) / 1000.0
+        return self._committed_w(session) / 1000.0
+
+    def _track_savings(self, plan: Plan):
+        """Peak demand and energy with vs. without load management (see SavingsTracker)."""
+        now = self._monotonic()
+        extra_kw = {}
+        for (charger_id, connector_id), session in plan.sessions.items():
+            actual = self.actual_draw_kw(session, now)
+            status = self.chargers[charger_id].connector(connector_id).status
+            drawing = ((charger_id, connector_id) not in plan.tapered
+                       and status not in NOT_DRAWING_STATUSES
+                       and (session.soc is None or session.soc < 100.0))
+            extra_kw[(charger_id, connector_id)] = (
+                gateway.unmanaged_ev_kw(actual, self.cfg, drawing=drawing) - actual)
+        site_kw = None if plan.decision.telemetry_stale else plan.site_load_kw
+        hours = self.savings.record(now, self._clock(), plan.in_peak, site_kw, sum(extra_kw.values()))
+        for key, kw in extra_kw.items():
+            plan.sessions[key].peak_shift_kwh += kw * hours
 
     def _summary(self, plan: Plan) -> str:
         d = plan.decision
@@ -1206,9 +1268,13 @@ async def start_server(cs: CentralSystem, host: str, port: int):
 
 
 async def main(cfg: SiteConfig):
+    import dashboard
+
     cs = CentralSystem(cfg)
     server = await start_server(cs, cfg.host, cfg.port)
     log.info("OCPP 1.6J central system listening on ws://%s:%d", cfg.host, cfg.port)
+    web = await dashboard.start_dashboard(cs, cfg.host, cfg.dashboard_port)
+    log.info("dashboard on http://%s:%d (demo controls are off on a live site)", cfg.host, web.port)
     background = [asyncio.create_task(allocation_loop(cs))]
     if cfg.grid_signal_enabled:
         log.info("grid signal poller enabled (stub: no live API is called)")
@@ -1220,6 +1286,7 @@ async def main(cfg: SiteConfig):
             task.cancel()
         server.close()
         await server.wait_closed()
+        await web.close()
         cs.close_all_sessions("ServerShutdown")
 
 

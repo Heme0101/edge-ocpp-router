@@ -264,7 +264,8 @@ def in_peak_window(cfg: SiteConfig, now: datetime) -> bool:
 
 
 def decide_ev_budget(cfg: SiteConfig, building_load_kw, telemetry_age_s,
-                     grid_signal_cap_kw, grid_signal_age_s, now: datetime) -> BudgetDecision:
+                     grid_signal_cap_kw, grid_signal_age_s, now: datetime,
+                     peak: bool | None = None) -> BudgetDecision:
     """This cycle's total EV budget.
 
     1. Building load: fresh CT reading -> panel limit - load - margin. No reading, or one
@@ -272,6 +273,7 @@ def decide_ev_budget(cfg: SiteConfig, building_load_kw, telemetry_age_s,
        not full power (which can trip breakers).
     2. Cap: a live grid signal no older than max_age_s wins; without one (offline),
        the local tariff peak windows apply. The lower of (1) and the cap is used.
+    peak: whether a tariff peak window is in effect; None = work it out from `now`.
     """
     stale = (building_load_kw is None or telemetry_age_s is None
              or telemetry_age_s > cfg.telemetry_stale_after_s)
@@ -282,13 +284,174 @@ def decide_ev_budget(cfg: SiteConfig, building_load_kw, telemetry_age_s,
                and 0.0 <= grid_signal_age_s <= cfg.grid_signal_max_age_s)
     if grid_ok:
         cap_kw, source = grid_signal_cap_kw, "grid"
-    elif in_peak_window(cfg, now):
+    elif (in_peak_window(cfg, now) if peak is None else peak):
         cap_kw, source = cfg.peak_budget_cap_kw, "peak"
     else:
         cap_kw, source = None, None
 
     budget_kw = base_kw if cap_kw is None else min(base_kw, cap_kw)
     return BudgetDecision(budget_kw, stale, cap_kw, source)
+
+
+# ---------------------------------------------------------------- tariff savings
+
+QUARTER_HOUR_MINUTES = 15       # PG&E bills demand as the highest 15-minute average kW
+
+
+def floor_cents(dollars) -> float:
+    """Dollars rounded DOWN to the cent: an estimate of savings must never be overstated."""
+    return math.floor(round(dollars * 100, 6)) / 100
+
+
+def demand_charge_savings(shaved_kw, rate_per_kw) -> float:
+    """The demand charge avoided: kW of monthly peak demand shaved x $/kW."""
+    return floor_cents(max(0.0, shaved_kw) * rate_per_kw)
+
+
+def energy_shift_savings(shifted_kwh, peak_rate_per_kwh, offpeak_rate_per_kwh) -> float:
+    """Energy moved out of the peak window is bought later at the off-peak rate instead:
+    kWh x (peak rate - off-peak rate)."""
+    return floor_cents(max(0.0, shifted_kwh) * (peak_rate_per_kwh - offpeak_rate_per_kwh))
+
+
+def unmanaged_ev_kw(actual_kw, cfg: SiteConfig, *, drawing: bool) -> float:
+    """What a car would draw if nobody managed it: the charger's full rating while it is
+    charging (a full or tapered car, or one that reports it is not drawing, would draw
+    what it draws now). Never less than what it actually draws."""
+    return max(actual_kw, cfg.max_charger_kw) if drawing else actual_kw
+
+
+@dataclass
+class _DemandInterval:
+    key: tuple                  # (year, month, day, hour, quarter) in site-local time
+    hours: float = 0.0
+    actual_kwh: float = 0.0
+    unmanaged_kwh: float = 0.0
+
+    def averages(self):
+        if self.hours <= 0.0:
+            return None
+        return self.actual_kwh / self.hours, self.unmanaged_kwh / self.hours
+
+
+class SavingsTracker:
+    """Peak-window demand and energy, with and without load management.
+
+    Fed once per allocation cycle with the measured site load (the main-feeder CT, EVs
+    included) and how much more the EVs would draw unmanaged. Times come from the
+    caller (monotonic seconds for durations, a timezone-aware datetime for calendar
+    boundaries), so it is fully testable. Counts only while a peak window is in effect
+    and the CT reading is fresh.
+
+    - Demand: averaged per 15-minute clock interval, as utilities bill it. The month's
+      highest interval average is kept for the actual site and for the unmanaged site;
+      the difference is the peak kW shaved. The interval in progress counts with its
+      average so far.
+    - Energy: kWh the EVs did not draw during the peak (unmanaged - actual), which is
+      assumed to be delivered later at the off-peak rate.
+    The month resets at the start of each calendar month in site-local time.
+    """
+
+    def __init__(self, cfg: SiteConfig, max_gap_s: float):
+        self.cfg, self.max_gap_s = cfg, max_gap_s
+        self._last_t: float | None = None
+        self.month: tuple | None = None
+        self._interval: _DemandInterval | None = None
+        self.month_max_actual_kw = 0.0
+        self.month_max_unmanaged_kw = 0.0
+        self.month_shifted_kwh = 0.0
+        self.run_shifted_kwh = 0.0
+        self.run_max_shaved_kw = 0.0
+        self.shaved_now_kw = 0.0
+
+    def record(self, t: float, now: datetime, in_peak: bool, site_kw: float | None,
+               extra_kw: float) -> float:
+        """One sample. Returns the hours it counted for (0 when not counted), so the caller
+        can split the shifted energy among sessions the same way."""
+        gap_s = 0.0 if self._last_t is None else min(max(0.0, t - self._last_t), self.max_gap_s)
+        self._last_t = t
+        local = now.astimezone(self.cfg.tz)
+        month = (local.year, local.month)
+        if month != self.month:
+            self._start_month(month)
+        key = (local.year, local.month, local.day, local.hour, local.minute // QUARTER_HOUR_MINUTES)
+        if self._interval is not None and self._interval.key != key:
+            self._close_interval()
+        counted = in_peak and site_kw is not None and math.isfinite(site_kw) and site_kw >= 0.0
+        extra_kw = max(0.0, extra_kw) if math.isfinite(extra_kw) else 0.0
+        self.shaved_now_kw = extra_kw if counted else 0.0
+        if not counted:
+            return 0.0
+        self.run_max_shaved_kw = max(self.run_max_shaved_kw, extra_kw)
+        if self._interval is None:
+            self._interval = _DemandInterval(key)
+        hours = gap_s / 3600.0
+        self._interval.hours += hours
+        self._interval.actual_kwh += site_kw * hours
+        self._interval.unmanaged_kwh += (site_kw + extra_kw) * hours
+        shifted = extra_kw * hours
+        self.month_shifted_kwh += shifted
+        self.run_shifted_kwh += shifted
+        return hours
+
+    def _start_month(self, month):
+        self.month, self._interval = month, None
+        self.month_max_actual_kw = self.month_max_unmanaged_kw = 0.0
+        self.month_shifted_kwh = 0.0
+
+    def _close_interval(self):
+        averages = self._interval.averages()
+        if averages is not None:
+            self.month_max_actual_kw = max(self.month_max_actual_kw, averages[0])
+            self.month_max_unmanaged_kw = max(self.month_max_unmanaged_kw, averages[1])
+        self._interval = None
+
+    def month_peaks_kw(self):
+        """(actual, unmanaged) highest 15-minute peak-window demand this month, including
+        the interval in progress."""
+        actual, unmanaged = self.month_max_actual_kw, self.month_max_unmanaged_kw
+        averages = self._interval.averages() if self._interval is not None else None
+        if averages is not None:
+            actual, unmanaged = max(actual, averages[0]), max(unmanaged, averages[1])
+        return actual, unmanaged
+
+    def snapshot(self) -> dict:
+        cfg = self.cfg
+        actual, unmanaged = self.month_peaks_kw()
+        shaved = max(0.0, unmanaged - actual)
+        result = {
+            "enabled": cfg.savings_enabled,
+            "rates": {"peak_demand_per_kw": cfg.peak_demand_rate_per_kw,
+                      "peak_energy_per_kwh": cfg.peak_energy_rate_per_kwh,
+                      "offpeak_energy_per_kwh": cfg.offpeak_energy_rate_per_kwh},
+            "shaved_now_kw": round(self.shaved_now_kw, 3),
+            "month": {
+                "month": None if self.month is None else f"{self.month[0]:04d}-{self.month[1]:02d}",
+                "peak_demand_actual_kw": round(actual, 3),
+                "peak_demand_unmanaged_kw": round(unmanaged, 3),
+                "peak_kw_shaved": round(shaved, 3),
+                "energy_shifted_kwh": round(self.month_shifted_kwh, 3),
+                "demand_savings_usd": None, "energy_savings_usd": None, "total_usd": None,
+            },
+            "run": {
+                "max_shaved_kw": round(self.run_max_shaved_kw, 3),
+                "energy_shifted_kwh": round(self.run_shifted_kwh, 3),
+                "energy_savings_usd": None,
+            },
+        }
+        if cfg.savings_enabled:
+            month = result["month"]
+            month["demand_savings_usd"] = demand_charge_savings(shaved, cfg.peak_demand_rate_per_kw)
+            month["energy_savings_usd"] = self.energy_usd(self.month_shifted_kwh)
+            month["total_usd"] = floor_cents(month["demand_savings_usd"] + month["energy_savings_usd"])
+            result["run"]["energy_savings_usd"] = self.energy_usd(self.run_shifted_kwh)
+        return result
+
+    def energy_usd(self, kwh) -> float | None:
+        if not self.cfg.savings_enabled:
+            return None
+        return energy_shift_savings(kwh, self.cfg.peak_energy_rate_per_kwh,
+                                    self.cfg.offpeak_energy_rate_per_kwh)
 
 
 def build_charging_profile(connector_id: int, allocated_kw: float, cfg: SiteConfig,

@@ -232,7 +232,8 @@ class SimSiteMeter:
 
     The other loads are load_kw (the building's base load), plus an HVAC compressor of
     hvac_kw that cycles on for hvac_period_s and off for hvac_period_s, plus random
-    variation of up to +/- noise_pct % of the base load, drawn anew for each reading."""
+    variation of up to +/- noise_pct % of the base load, drawn anew for each reading,
+    plus any temporary spike started with start_spike()."""
 
     def __init__(self, meter_id, load_kw, *, chargers=(), interval_s=5.0, dropout_after_s=None,
                  hvac_kw=0.0, hvac_period_s=None, noise_pct=0.0, seed=None, quiet=False):
@@ -242,6 +243,16 @@ class SimSiteMeter:
         self._rng = random.Random(seed)
         self._noise_kw = 0.0
         self._started = time.monotonic()
+        self.spike_kw, self.spike_until = 0.0, None
+
+    def start_spike(self, kw, seconds):
+        """Add kw to the other loads for the next `seconds` (e.g. a large HVAC unit starting)."""
+        self.spike_kw, self.spike_until = kw, time.monotonic() + seconds
+
+    def spike_remaining_s(self):
+        if self.spike_until is None:
+            return 0.0
+        return max(0.0, self.spike_until - time.monotonic())
 
     def hvac_on(self):
         if not self.hvac_kw or not self.hvac_period_s:
@@ -249,7 +260,8 @@ class SimSiteMeter:
         return (time.monotonic() - self._started) % (2 * self.hvac_period_s) < self.hvac_period_s
 
     def other_kw(self):
-        return max(0.0, self.load_kw + (self.hvac_kw if self.hvac_on() else 0.0) + self._noise_kw)
+        spike = self.spike_kw if self.spike_remaining_s() > 0.0 else 0.0
+        return max(0.0, self.load_kw + (self.hvac_kw if self.hvac_on() else 0.0) + spike + self._noise_kw)
 
     def total_kw(self):
         return self.other_kw() + sum(charger.power_w() for charger in self.chargers) / 1000.0

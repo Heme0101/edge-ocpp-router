@@ -36,7 +36,10 @@ def test_shipped_config_values():
     assert cfg.peak_budget_cap_kw == 5.0
     assert cfg.timezone == "America/Los_Angeles"
     assert cfg.grid_signal_enabled is False
-    assert (cfg.host, cfg.port) == ("localhost", 9000)
+    assert (cfg.host, cfg.port, cfg.dashboard_port) == ("localhost", 9000, 8000)
+    assert (cfg.peak_demand_rate_per_kw, cfg.peak_energy_rate_per_kwh,
+            cfg.offpeak_energy_rate_per_kwh) == (25.0, 0.42, 0.18)
+    assert cfg.savings_enabled
 
 
 def test_shipped_limit_fits_the_service_continuously():
@@ -161,6 +164,19 @@ def test_missing_section(tmp_path):
     ("server", "port", 9000.5),
     ("server", "allocation_interval_s", 0),
     ("server", "call_timeout_s", -1),
+    ("server", "dashboard_port", 9000),           # same as the OCPP port
+    ("server", "dashboard_port", 70000),
+    ("server", "dashboard_port", "8000"),
+    ("server", "dashboard_port", True),
+    ("tariff", "peak_demand_rate_per_kw", -1.0),
+    ("tariff", "peak_demand_rate_per_kw", 2500.0),     # cents typed as dollars
+    ("tariff", "peak_demand_rate_per_kw", "25"),
+    ("tariff", "peak_demand_rate_per_kw", True),
+    ("tariff", "peak_demand_rate_per_kw", None),
+    ("tariff", "peak_energy_rate_per_kwh", 42.0),      # cents typed as dollars
+    ("tariff", "peak_energy_rate_per_kwh", -0.1),
+    ("tariff", "peak_energy_rate_per_kwh", 0.10),      # below the off-peak rate
+    ("tariff", "offpeak_energy_rate_per_kwh", 0.50),   # above the peak rate
 ])
 def test_bad_values_rejected(tmp_path, section, key, value):
     with pytest.raises(ConfigError):
@@ -184,3 +200,38 @@ def test_peak_window_bounds(minute, inside):
 @pytest.mark.parametrize("minute, inside", [(1319, False), (1320, True), (0, True), (119, True), (120, False)])
 def test_peak_window_past_midnight(minute, inside):
     assert PeakWindow(22 * 60, 2 * 60).contains(minute) is inside
+
+
+def test_demo_config_is_valid():
+    cfg = load_site_config(DEFAULT_CONFIG_PATH.with_name("site_config.demo.json"))
+    assert (cfg.panel_limit_kw, cfg.safety_margin_kw) == (600.0, 120.0)
+    assert cfg.continuous_capacity_kw == pytest.approx(675.0)   # 750 kVA transformer x 0.9
+    assert cfg.max_charger_kw == 9.984 and cfg.session_log_path is None
+
+
+def test_tariff_rates_are_optional(tmp_path):
+    data = copy.deepcopy(RAW)
+    for key in ("peak_demand_rate_per_kw", "peak_energy_rate_per_kwh", "offpeak_energy_rate_per_kwh"):
+        del data["tariff"][key]
+    cfg = load_site_config(write(tmp_path, data))
+    assert cfg.peak_demand_rate_per_kw is None and not cfg.savings_enabled
+
+
+def test_tariff_rates_all_or_none(tmp_path):
+    data = copy.deepcopy(RAW)
+    del data["tariff"]["offpeak_energy_rate_per_kwh"]
+    with pytest.raises(ConfigError, match="offpeak_energy_rate_per_kwh"):
+        load_site_config(write(tmp_path, data))
+
+
+def test_tariff_rates_all_or_none_on_replace():
+    with pytest.raises(ConfigError, match="all three"):
+        dataclasses.replace(load_site_config(), peak_demand_rate_per_kw=None)
+
+
+def test_zero_rates_are_allowed(tmp_path):
+    data = copy.deepcopy(RAW)
+    data["tariff"].update(peak_demand_rate_per_kw=0, peak_energy_rate_per_kwh=0.3,
+                          offpeak_energy_rate_per_kwh=0.3)
+    cfg = load_site_config(write(tmp_path, data))
+    assert cfg.peak_demand_rate_per_kw == 0.0 and cfg.savings_enabled
