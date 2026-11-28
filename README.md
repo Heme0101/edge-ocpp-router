@@ -123,7 +123,7 @@ continuous at power factor 0.9), a 600 kW limit with a 120 kW safety margin, and
   * a 150 kW HVAC spike lasting 30 s
   * the PG&E 4–9 PM peak window, which can be forced on or off
 * **Power flow:** grid → main panel → building and EV chargers. A capacity bar shows the
-  building load, the EV draw and the 120 kW safety margin against the 600 kW limit.
+  building load, the EV draw and the 120 kW NEC Safety Reserve against the 600 kW limit.
 * **Estimated savings:** this month and this session, and the peak kW shaved right now.
 * **One card per charger:**
   * SoC
